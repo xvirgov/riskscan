@@ -1,0 +1,12 @@
+{
+  "name": "riskscan",
+  "owner": { "name": "xvirgov", "url": "https://github.com/xvirgov" },
+  "plugins": [
+    {
+      "name": "riskscan",
+      "source": "./",
+      "description": "Advisory traffic-light risk gate for Claude Code (Bash/Write/Edit). Warn, don't block; fail-loud.",
+      "version": "0.1.0"
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "score_scale": 10,
+  "on_missing": "suggest",
+  "quiet_safe": false,
+  "ask_threshold": 7,
+  "analyzers": {
+    "builtin": { "enabled": true },
+    "sh-guard": { "enabled": false },
+    "osv-scanner": { "enabled": true },
+    "guarddog": { "enabled": true },
+    "bandit": { "enabled": true }
+  }
+}

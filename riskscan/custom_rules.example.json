@@ -1,0 +1,12 @@
+{
+  "_comment": "Copy this file to custom_rules.json (same directory) to activate. Each rule is [regex, score 1-10, label]. Rules are appended to the built-in packs and the highest score wins, so a custom rule can only RAISE an action's score, never hide a built-in finding. Regex is Python re syntax; remember JSON needs backslashes doubled.",
+  "bash": [
+    ["\\bnpm\\s+publish\\b", 7, "npm publish (releases a package publicly)"],
+    ["\\bgcloud\\b[^\\n]*\\bdelete\\b", 7, "gcloud: delete resource"],
+    ["\\baz\\b[^\\n]*\\bdelete\\b", 7, "az: delete resource"]
+  ],
+  "python": [
+    ["\\brequests\\.(post|put|delete)\\s*\\(", 4, "outbound mutating HTTP"]
+  ],
+  "js": []
+}

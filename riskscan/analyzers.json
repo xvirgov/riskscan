@@ -1,0 +1,44 @@
+{
+  "builtin": {
+    "surfaces": ["bash", "deps", "python", "js", "ts"],
+    "builtin": true,
+    "network": false
+  },
+  "sh-guard": {
+    "surfaces": ["bash"],
+    "detect": "sh-guard",
+    "run": ["sh-guard", "{command}"],
+    "parse": "shguard",
+    "network": false,
+    "install": { "note": "library (github.com/aryanbhosale/sh-guard), py3.12 wheel, no CLI — needs a venv + a `sh-guard` shim on PATH that prints classify() JSON; see README" }
+  },
+  "osv-scanner": {
+    "surfaces": ["deps"],
+    "deps_scope": "manifest",
+    "detect": "osv-scanner",
+    "run": ["osv-scanner", "scan", "source", "--lockfile", "{manifest}", "--format", "json"],
+    "parse": "osv",
+    "network": true,
+    "needs": "manifest",
+    "no_extractor": ["package.json", "pyproject.toml"],
+    "install": { "brew": "brew install osv-scanner", "go": "go install github.com/google/osv-scanner/cmd/osv-scanner@latest" }
+  },
+  "guarddog": {
+    "surfaces": ["deps"],
+    "deps_scope": "any",
+    "detect": "guarddog",
+    "handler": "guarddog",
+    "parse": "guarddog",
+    "network": true,
+    "install": { "note": "needs Python 3.10+: brew install pipx && pipx install guarddog (or docker pull ghcr.io/datadog/guarddog)" }
+  },
+  "bandit": {
+    "surfaces": ["python"],
+    "detect": "bandit",
+    "run": ["bandit", "-f", "json", "{file}"],
+    "parse": "bandit",
+    "network": false,
+    "needs": "file",
+    "install": { "pipx": "pipx install bandit" }
+  }
+}

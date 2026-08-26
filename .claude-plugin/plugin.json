@@ -1,0 +1,11 @@
+{
+  "name": "riskscan",
+  "displayName": "riskscan",
+  "description": "Advisory PreToolUse risk gate — one traffic-light banner (🟢🟡🔴⚪) per Bash/Write/Edit. Warns, never blocks; fail-loud on what it couldn't check.",
+  "version": "0.1.0",
+  "author": { "name": "xvirgov", "url": "https://github.com/xvirgov" },
+  "homepage": "https://github.com/xvirgov/riskscan",
+  "repository": "https://github.com/xvirgov/riskscan",
+  "license": "Apache-2.0",
+  "keywords": ["security", "hooks", "static-analysis", "supply-chain", "pretooluse", "risk-scoring"]
+}
