@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 riskscan.log
 riskscan/custom_rules.json
+riskscan/config.json
 .shguard-venv/
 .venv/
 .DS_Store

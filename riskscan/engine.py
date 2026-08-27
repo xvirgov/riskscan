@@ -38,6 +38,9 @@ def load_json(name, default):
 
 
 DEFAULT_CONFIG = load_json("config.default.json", {})
+# A local config.json (gitignored) overrides the shipped default, so an install can enable/tune
+# analyzers without editing the tracked default. Falls back to config.default.json when absent.
+CONFIG = load_json("config.json", None) or DEFAULT_CONFIG
 REGISTRY = load_json("analyzers.json", {})
 
 
@@ -648,7 +651,7 @@ def analyze(action, config=None, registry=None):
     the action has nothing to analyze. `findings` = [(analyzer, score, label)];
     `skipped` = [(analyzer, surface, reason, hint)].
     """
-    config = config if config is not None else DEFAULT_CONFIG
+    config = config if config is not None else CONFIG
     registry = registry if registry is not None else REGISTRY
     targets = targets_from_action(action)
     if not targets:

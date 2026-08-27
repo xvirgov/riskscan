@@ -15,6 +15,28 @@ risky minority still gets flagged.
   • [builtin:bash] read-only / print [1/10]
 ```
 
+## Quickstart
+
+Try it in ten seconds — no install, no config. Clone and score a command:
+```
+git clone https://github.com/xvirgov/riskscan && cd riskscan
+python3 adapters/claude_code.py --command "rm -rf /"     # 🔴 10/10, builtin only
+python3 adapters/claude_code.py --doctor                 # which analyzers are installed
+```
+
+Install it as a Claude Code plugin (the hook loads in a new session):
+```
+/plugin marketplace add xvirgov/riskscan
+/plugin install riskscan@riskscan
+```
+
+Add whatever optional analyzers you want — `builtin` needs nothing, the rest are bring-your-own-binary:
+```
+brew install osv-scanner        # dependency CVEs
+pipx install guarddog bandit    # malicious packages + Python SAST
+```
+`--doctor` shows what's found and what's still missing. To enable/disable analyzers or tune scores, copy `riskscan/config.default.json` → `riskscan/config.json` and `riskscan/custom_rules.example.json` → `riskscan/custom_rules.json` (both git-ignored, so they're yours to keep local).
+
 ## States
 
 | Banner | Meaning |
