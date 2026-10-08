@@ -299,9 +299,18 @@ shapes only; the entropy tier warns and passes). Bypass: `--no-verify` or `RISKS
 
 Consequences of that split, by design:
 
-- **Every version-control write scores 10/10.** `git add`, `git commit`, `git push` are top-of-scale
-  regardless of findings, because the authoritative scan happens in the hook and the banner is the
-  prompt that says so. Read-only git (`status`, `log`, `diff`, `show`) is unaffected at 1/10.
+- **An *unchecked* version-control write scores 10/10.** With no hooks installed, the agent layer
+  is the only thing looking, so `git add`/`commit`/`push` are top-of-scale regardless of findings
+  (`secrets.unchecked_write_score`). Once the hooks are installed that stops: they block at commit
+  and push on the actual index, so the synthetic score would fire on every routine commit while
+  adding nothing — the same question that silences the ⚪ handoff retires it. Read-only git
+  (`status`, `log`, `diff`, `show`) is 1/10 either way.
+
+  ```
+  hooks absent,  git commit (clean)      -> 🔴 10/10  nothing downstream will check this
+  hooks present, git commit (clean)      -> 🟡  4/10  silent pass
+  hooks present, git commit (credential) -> 🔴  9/10  prompt, credential bullet first
+  ```
 - **A directory change is no longer predicted.** `cd`, `pushd`, a subshell, `env -C` or a variable
   target means the agent layer does not resolve the tree at all. With the hooks installed it says
   nothing (the handoff is covered); without them it reads ⚪ with an install hint.

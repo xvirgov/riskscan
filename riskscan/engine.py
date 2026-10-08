@@ -188,7 +188,7 @@ def targets_from_action(action):
     kind = action.get("kind")
     if kind == "command":
         cmd = action.get("command") or ""
-        targets.append({"surface": "bash", "command": cmd})
+        targets.append({"surface": "bash", "command": cmd, "cwd": action.get("cwd")})
         for eco, pat in INSTALL_PATTERNS:
             for m in re.finditer(pat, cmd):
                 pkgs = strip_pkgs(m.group(1))
@@ -219,20 +219,26 @@ def targets_from_action(action):
 
 
 # ── built-in analyzer ─────────────────────────────────────────────────────────
-def builtin_bash(cmd):
+POLICY_LABEL = ("git: writes to version control and no authoritative scan is installed"
+                " → riskscan --install-git-hooks")
+
+
+def builtin_bash(cmd, cwd=None):
     findings = []
     max_score = 0
     for pat, score, label in BASH_RULES:
         if re.search(pat, cmd):
             findings.append((score, label))
             max_score = max(max_score, score)
-    # A command that puts content into version control is scored at the top of the scale by
-    # policy: the authoritative check is the pre-commit/pre-push hook, and this is the prompt
-    # that says so. Read-only git (status/log/diff/...) is unaffected — see SAFE_SUBCMDS.
-    if any(rx.search(cmd) for _, rx in GIT_SECRET_CMDS):
-        findings.append((10, "git: writes to version control (authoritative scan is the "
-                             "pre-commit/pre-push hook)"))
-        max_score = 10
+    # Content entering version control with NOTHING downstream to check it is top-of-scale by
+    # policy. Once the git hooks are installed that is no longer true — they block at commit and
+    # push, inside the right tree, on the actual index — so the synthetic score would fire on
+    # every routine commit while adding nothing. Same question as the ⚪ handoff, asked once.
+    # Read-only git (status/log/diff/...) is unaffected; see SAFE_SUBCMDS.
+    if any(rx.search(cmd) for _, rx in GIT_SECRET_CMDS) and not git_hooks_installed(cwd):
+        sc = int(((CONFIG.get("secrets") or {}).get("unchecked_write_score", 10)))
+        findings.append((sc, POLICY_LABEL))
+        max_score = max(max_score, sc)
     rm = rm_score(cmd)
     if rm:
         findings.append(rm)
@@ -486,6 +492,9 @@ def _has_cd(cmd):
 HOOK_MARKER = "# >>> riskscan >>>"
 
 
+_HOOKS_CACHE = {}
+
+
 def git_hooks_installed(cwd=None):
     """True when riskscan's own git hooks are in place, making them the authoritative scan.
 
@@ -493,6 +502,9 @@ def git_hooks_installed(cwd=None):
     is noise, not fail-loud. When they are absent the note carries an install hint instead,
     exactly as a missing analyzer does.
     """
+    key = cwd or ""
+    if key in _HOOKS_CACHE:
+        return _HOOKS_CACHE[key]
     paths = []
     gp = _git_out(cwd or os.getcwd(), ["config", "--get", "core.hooksPath"]) if cwd else None
     if gp and gp.strip():
@@ -505,9 +517,11 @@ def git_hooks_installed(cwd=None):
         try:
             with open(f) as fh:
                 if HOOK_MARKER in fh.read():
+                    _HOOKS_CACHE[key] = True
                     return True
         except Exception:
             continue
+    _HOOKS_CACHE[key] = False
     return False
 
 
@@ -1193,7 +1207,7 @@ def analyze(action, config=None, registry=None):
                 continue  # e.g. osv: only audit persisted manifests, not throwaway installs (out of scope)
             if spec.get("builtin"):
                 if surf == "bash":
-                    sc, fs = builtin_bash(t["command"])
+                    sc, fs = builtin_bash(t["command"], t.get("cwd"))
                     satisfied.add("bash")
                 elif surf == "python":
                     sc, fs = builtin_python(t.get("content", ""))
@@ -1255,7 +1269,10 @@ def render_banner(report):
     _, glyph, word = report["state"]
     overall, surfaces = report["overall"], report["surfaces"]
     lines = ["%s %d/10 %s — riskscan [%s]" % (glyph, overall, word, ", ".join(surfaces))]
-    for name, s, lbl in sorted(report["findings"], key=lambda x: -x[1]):
+    # The policy line can outscore a real credential, which would put the bullet you most need
+    # to read underneath it. Rank actual findings first, then by score.
+    for name, s, lbl in sorted(report["findings"],
+                               key=lambda x: (x[2].startswith(POLICY_LABEL[:28]), -x[1])):
         if overall > 2 and lbl.startswith(("no known-dangerous", "no credential pattern", "no findings")):
             continue  # drop "nothing found" filler once a real finding exists
         lines.append("  • [%s] %s [%d/10]" % (name, lbl, s))

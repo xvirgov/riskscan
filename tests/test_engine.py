@@ -73,13 +73,37 @@ def test_safe_reads():
         assert score(cmd) == 1, cmd
 
 
-def test_version_control_writes_are_top_of_scale():
-    """Policy: anything that puts content into version control scores 10, because the
-    authoritative scan is the git hook and this is the prompt that says so."""
+def test_unchecked_version_control_writes_are_top_of_scale():
+    """With no authoritative scan downstream, content entering git is top-of-scale: the agent
+    layer is the only thing looking."""
     for cmd in ["git add -A", "git commit -m wip", "git push origin main", "git add -p file"]:
         assert score(cmd) == 10, cmd
     for cmd in ["git status", "git log --oneline", "git diff HEAD~1", "git show abc123"]:
         assert score(cmd) == 1, cmd
+
+
+def test_installed_hooks_retire_the_policy_score():
+    """Once the hooks block at commit and push, the synthetic score adds nothing and would fire
+    on every routine commit. The same question that silences the ⚪ handoff silences this."""
+    for cmd in ["git add -A", "git commit -m wip", "git push origin feature/x"]:
+        r = report(cmd, hooks_installed=True)
+        # assert the policy contribution is gone, not an exact total: a local custom_rules.json
+        # may legitimately score these commands for unrelated reasons.
+        assert not any(lbl.startswith("git: writes to version control")
+                       for _, _, lbl in r["findings"]), cmd
+        assert r["overall"] < 10, (cmd, r["findings"])
+
+
+def test_a_real_finding_leads_the_banner():
+    """The policy line outscores a credential, so ranking by score alone would bury the bullet
+    the user most needs to read."""
+    r = {"surfaces": ["bash", "secrets"], "skipped": [], "overall": 10,
+         "state": engine.state_of(10),
+         "findings": [("builtin:bash", 10, engine.POLICY_LABEL),
+                      ("builtin:secrets", 9, "GitHub token — .env:1 (staged)")]}
+    body = engine.render_banner(r).splitlines()
+    assert "GitHub token" in body[1], body
+    assert "writes to version control" in body[2], body
 
 
 def test_known_dangerous():
@@ -268,7 +292,7 @@ def test_handoff_is_silent_once_the_hooks_are_installed():
         r = report("cd /srv/app && git add -A", cwd=clean, hooks_installed=True)
         assert r["skipped"] == [], r["skipped"]
         assert not secret_findings(r)
-        assert r["overall"] == 10  # still top-of-scale by policy
+        assert r["overall"] <= 2, r["findings"]  # the hook is the scan; nothing to shout about
     finally:
         shutil.rmtree(clean, ignore_errors=True)
 
