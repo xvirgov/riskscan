@@ -271,27 +271,52 @@ Public key material is deliberately green — `*.pub`, `known_hosts` and `ssh_co
 secret. A passphrase-protected private key is **not** green: the passphrase is brute-forcible
 once the file is in history.
 
+### Two layers, and why the git one blocks
+
+The agent layer is handed a *command string* and has to predict what a shell will do to the
+filesystem. That prediction is unbounded — subshells, `env -C`, `$PWD`, symlinked repos — and
+every gap in it is a silent false green. A git hook has no such problem: git runs it **inside**
+the repository with the index already built, so "which tree, which files, which content" are
+facts. So the two layers divide by what they can know, not by what they scan:
+
+| Layer | Sees | Catches uniquely | Verdict |
+|---|---|---|---|
+| PreToolUse (`claude_code.py`) | proposed *content*, before the file exists | secrets that never reach git; warns before the agent acts | advisory |
+| `pre-commit` (`git_hook.py --staged`) | the actual index, via `git show :<path>` | non-Write arrivals (`cp ~/.aws/credentials .`), **partial stages** (`git add -p`), your own manual commits | **blocks** |
+| `pre-push` (`git_hook.py --pre-push`) | the pushed range, from git's stdin | a secret committed and later removed — still in the history being pushed | **blocks** |
+
+```bash
+python3 adapters/git_hook.py --install --global   # ~/.githooks + core.hooksPath
+python3 adapters/git_hook.py --status
+python3 adapters/git_hook.py --uninstall --global
+```
+
+The global install **chains** rather than clobbers: `core.hooksPath` overrides `.git/hooks`, which
+would otherwise silently disable the pre-commit framework in every repo that uses it, so the
+generated hook execs a repo-local hook first (via `--absolute-git-dir`, never `--git-path hooks`,
+which would resolve back to itself). Blocks at `secrets.block_threshold` (default 9 — tier-1
+shapes only; the entropy tier warns and passes). Bypass: `--no-verify` or `RISKSCAN_SKIP=1`.
+
+Consequences of that split, by design:
+
+- **Every version-control write scores 10/10.** `git add`, `git commit`, `git push` are top-of-scale
+  regardless of findings, because the authoritative scan happens in the hook and the banner is the
+  prompt that says so. Read-only git (`status`, `log`, `diff`, `show`) is unaffected at 1/10.
+- **A directory change is no longer predicted.** `cd`, `pushd`, a subshell, `env -C` or a variable
+  target means the agent layer does not resolve the tree at all. With the hooks installed it says
+  nothing (the handoff is covered); without them it reads ⚪ with an install hint.
+- Over a *range*, the builtin's line numbers are approximate — several commits' added lines are
+  synthesized into one view. gitleaks' per-commit numbers are exact; both are reported.
+
 ### Limits, in the order you'll hit them
 
 - On the git surface, fixture and vendored trees (`tests/`, `fixtures/`, `vendor/`,
   `node_modules/`, `*.example`, lockfiles) are skipped, and the scan is capped at 40 files /
   256KB each — tune `secrets.skip_paths` and `secrets.max_files` in config. A single-file
   **write** is never path-skipped; the entropy gate does that job instead.
-- `git push` scans the current content of the changed files, **not** the commit history, so a
-  secret added and then removed across the unpushed range is missed. Range scanning is what
-  gitleaks' `--log-opts` is for — that's the planned follow-up.
-- The directory the changeset is resolved in follows `cd`/`pushd` ahead of the git command and
-  `git -C`, and paths are joined against the repository **root** (which is what git prints them
-  relative to), so working in a subdirectory resolves correctly.
-- `$VAR` in a `cd` target is resolved from a literal assignment earlier in the same command
-  (`D=/srv/app && cd "$D" && git add -A`) or from the hook's own environment. Reading variables
-  is free; *evaluating* the prefix to find out would mean executing an unapproved command
-  substitution from inside the thing meant to vet it, so that line is not crossed.
-- A changeset it cannot read reads ⚪ NOT ANALYZED — never green. That covers: no upstream, not a
-  repo, an unparseable pathspec, `--git-dir`/`--work-tree`, and the `cd` targets that genuinely
-  need execution — command substitution (`cd $(mktemp -d)`), an unset variable, `cd -`, a glob.
-  Resolving the *wrong* tree would report a confident green for a changeset nobody looked at,
-  which is strictly worse than admitting ignorance.
+- A changeset it cannot read reads ⚪ NOT ANALYZED — never green. Resolving the *wrong* tree would
+  report a confident green for a changeset nobody looked at, which is strictly worse than
+  admitting ignorance.
 - For `Edit`/`MultiEdit` the line number is relative to the edited fragment, not the file.
 
 ## Custom rules

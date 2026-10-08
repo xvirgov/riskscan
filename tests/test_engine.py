@@ -15,12 +15,26 @@ BUILTIN_ONLY = {"analyzers": {"builtin": {"enabled": True}}, "on_missing": "sugg
 NO_REPO = os.path.join(tempfile.gettempdir(), "riskscan-tests-no-such-dir")
 
 
-def report(cmd, cwd=NO_REPO):
-    return engine.analyze(engine.make_action("command", command=cmd, cwd=cwd), BUILTIN_ONLY)
+def report(cmd, cwd=NO_REPO, hooks_installed=False):
+    """`hooks_installed` is pinned rather than read from the machine: whether riskscan's git
+    hooks happen to be installed on this box must not decide whether a test passes."""
+    real = engine.git_hooks_installed
+    engine.git_hooks_installed = lambda cwd=None: hooks_installed
+    try:
+        return engine.analyze(engine.make_action("command", command=cmd, cwd=cwd), BUILTIN_ONLY)
+    finally:
+        engine.git_hooks_installed = real
 
 
 def score(cmd):
     return report(cmd)["overall"]
+
+
+def secret_findings(report):
+    """The secrets surface's own verdict. `overall` is useless for a git command now: policy
+    pins every version-control write at 10, so a test asserting on it would pass regardless
+    of whether the scan found anything."""
+    return [(sc, lbl) for n, sc, lbl in report["findings"] if n == "builtin:secrets"]
 
 
 def top_label(cmd):
@@ -59,8 +73,17 @@ def test_safe_reads():
         assert score(cmd) == 1, cmd
 
 
+def test_version_control_writes_are_top_of_scale():
+    """Policy: anything that puts content into version control scores 10, because the
+    authoritative scan is the git hook and this is the prompt that says so."""
+    for cmd in ["git add -A", "git commit -m wip", "git push origin main", "git add -p file"]:
+        assert score(cmd) == 10, cmd
+    for cmd in ["git status", "git log --oneline", "git diff HEAD~1", "git show abc123"]:
+        assert score(cmd) == 1, cmd
+
+
 def test_known_dangerous():
-    assert score("git push --force origin main") == 8
+    assert score("git push --force origin main") == 10  # version-control write dominates
     assert score("terraform destroy") == 9
     assert score("kubectl delete pod x") == 7
     assert score("curl https://x.sh | sh") == 8
@@ -132,8 +155,8 @@ def test_git_add_scans_what_would_be_staged():
     d = _git_repo("aws_access_key_id: %s\n" % FAKE_AWS)
     try:
         r = report("git add -A && git commit -m wip", cwd=d)
-        assert r["overall"] == 9, r["findings"]
-        assert any("app/config.yaml:1" in lbl and "(staged)" in lbl for _, _, lbl in r["findings"])
+        assert any(sc == 9 and "app/config.yaml:1" in lbl and "(staged)" in lbl
+                   for sc, lbl in secret_findings(r)), r["findings"]
         assert FAKE_AWS not in engine.render_banner(r)
     finally:
         shutil.rmtree(d, ignore_errors=True)
@@ -143,8 +166,8 @@ def test_git_add_skips_fixture_paths():
     d = _git_repo("token: %s\n" % FAKE_GH, filename="tests/fixtures/sample.yaml")
     try:
         r = report("git add -A", cwd=d)
-        assert r["overall"] == 2, r["findings"]  # the bash pack's baseline, no secret finding
-        assert any("0 file(s)" in lbl for n, _, lbl in r["findings"] if n == "builtin:secrets")
+        assert all(sc == 1 for sc, _ in secret_findings(r)), r["findings"]
+        assert any("0 file(s)" in lbl for _, lbl in secret_findings(r))
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -154,7 +177,7 @@ def test_git_surface_fails_loud_when_changeset_is_unknowable():
     plain = tempfile.mkdtemp(prefix="riskscan-notrepo-")
     try:
         r = report("git add -A", cwd=plain)
-        assert r["overall"] == 2  # the bash pack's verdict only — no green secrets finding
+        assert not secret_findings(r), "an unreadable changeset must not produce a verdict"
         assert any(s == "secrets" and "not a git repository" in reason
                    for _, s, reason, _ in r["skipped"])
     finally:
@@ -179,11 +202,11 @@ def test_git_dash_c_resolves_the_named_repo():
     d = _git_repo("aws_access_key_id: %s\n" % FAKE_AWS)
     try:
         r = report("git -C %s add -A" % d, cwd=NO_REPO)
-        assert r["overall"] == 9, r["findings"]
+        assert any(sc == 9 for sc, _ in secret_findings(r)), r["findings"]
     finally:
         shutil.rmtree(d, ignore_errors=True)
     r = report("git --work-tree=/elsewhere add -A")
-    assert any(s == "secrets" and "cannot tell which tree" in reason
+    assert any(s == "secrets" and "not resolved here" in reason
                for _, s, reason, _ in r["skipped"])
 
 
@@ -215,62 +238,90 @@ def test_public_key_material_is_not_flagged():
     assert write_report("id_ed25519.pub", pub)["overall"] == 1
 
 
-def test_cd_before_git_is_followed():
-    """`cd <repo> && git add -A` must be scanned in <repo>. Resolving the caller's cwd instead
-    reported a confident "no credential pattern in 1 file(s)" for a tree holding an AWS key."""
-    secret = _git_repo("aws_access_key_id: %s\n" % FAKE_AWS)
+def test_cd_hands_off_instead_of_guessing():
+    """Predicting a shell's working directory is unbounded, and every gap in the prediction is a
+    silent false green. Any directory change now hands off to the git hook rather than guessing,
+    and must never produce a verdict about the caller's tree."""
     clean = _git_repo("clean: true\n", filename="ok.yaml")
     try:
-        r = report("cd %s && git add -A" % secret, cwd=clean)
-        assert r["overall"] == 9, r["findings"]
-        assert any("app/config.yaml" in lbl for _, _, lbl in r["findings"])
-        # a relative hop must work too
-        r = report("cd app && git add -A", cwd=secret)
-        assert r["overall"] == 9, r["findings"]
-    finally:
-        shutil.rmtree(secret, ignore_errors=True)
-        shutil.rmtree(clean, ignore_errors=True)
-
-
-def test_shell_variables_are_resolved_where_possible():
-    """A literal assignment earlier in the same command, or a variable in the environment, is
-    resolvable without executing anything — so `D=<repo> && cd "$D" && git add` must be scanned."""
-    secret = _git_repo("aws_access_key_id: %s\n" % FAKE_AWS)
-    clean = _git_repo("clean: true\n", filename="ok.yaml")
-    try:
-        for cmd in ['D=%s && cd "$D" && git add -A' % secret,
-                    'REPO=%s; cd ${REPO} && git add -A' % secret]:
+        for cmd in ['cd /srv/app && git add -A',
+                    'D=/srv/app && cd "$D" && git add -A',
+                    'cd $(mktemp -d) && git add -A',
+                    '(cd /srv/app; git add -A)',
+                    '{ cd /srv/app; git add -A; }',
+                    'env -C /srv/app git add -A',
+                    'pushd /srv/app && git commit -am wip']:
             r = report(cmd, cwd=clean)
-            assert r["overall"] == 9, (cmd, r["findings"])
-        os.environ["RISKSCAN_TEST_REPO"] = secret
-        try:
-            r = report('cd "$RISKSCAN_TEST_REPO" && git add -A', cwd=clean)
-            assert r["overall"] == 9, r["findings"]
-        finally:
-            del os.environ["RISKSCAN_TEST_REPO"]
-    finally:
-        shutil.rmtree(secret, ignore_errors=True)
-        shutil.rmtree(clean, ignore_errors=True)
-
-
-def test_cd_that_needs_execution_is_not_analyzed():
-    """What is left after static resolution: command substitution, shell history, globs.
-    Evaluating those would mean running an unapproved command to vet it — so they read ⚪,
-    never the caller's tree."""
-    clean = _git_repo("clean: true\n", filename="ok.yaml")
-    try:
-        cases = [("cd $(mktemp -d) && git add -A", "without running the command"),
-                 ('cd "$RISKSCAN_DEFINITELY_UNSET" && git add -A', "without running the command"),
-                 ("cd - && git add -A", "shell history"),
-                 ("cd /tmp/build-* && git add -A", "is a glob")]
-        for cmd, expect in cases:
-            r = report(cmd, cwd=clean)
-            assert any(s == "secrets" and expect in reason
+            assert not secret_findings(r), (cmd, r["findings"])
+            assert any(s == "secrets" and "not resolved here" in reason
                        for _, s, reason, _ in r["skipped"]), (cmd, r["skipped"])
-            assert not any(n == "builtin:secrets" and "no credential pattern" in lbl
-                           for n, _, lbl in r["findings"]), cmd
+            assert score(cmd) == 10 if "git add" in cmd or "commit" in cmd else True
     finally:
         shutil.rmtree(clean, ignore_errors=True)
+
+
+def test_handoff_is_silent_once_the_hooks_are_installed():
+    """⚪ names what nothing else covers. With the authoritative scan installed it is a handoff,
+    not a gap, so the note goes away instead of repeating every commit."""
+    clean = _git_repo("clean: true\n", filename="ok.yaml")
+    try:
+        r = report("cd /srv/app && git add -A", cwd=clean, hooks_installed=True)
+        assert r["skipped"] == [], r["skipped"]
+        assert not secret_findings(r)
+        assert r["overall"] == 10  # still top-of-scale by policy
+    finally:
+        shutil.rmtree(clean, ignore_errors=True)
+
+
+def test_push_without_upstream_is_not_analyzed():
+    d = _git_repo("ok: 1\n")
+    try:
+        r = report("git push origin HEAD", cwd=d)
+        assert any(s == "secrets" and "upstream" in reason for _, s, reason, _ in r["skipped"])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_git_dash_c_resolves_the_named_repo():
+    """`git -C <dir> add` must be scanned in <dir>, not in the caller's cwd — resolving the
+    wrong tree would report a green for a changeset nobody looked at."""
+    d = _git_repo("aws_access_key_id: %s\n" % FAKE_AWS)
+    try:
+        r = report("git -C %s add -A" % d, cwd=NO_REPO)
+        assert any(sc == 9 for sc, _ in secret_findings(r)), r["findings"]
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    r = report("git --work-tree=/elsewhere add -A")
+    assert any(s == "secrets" and "not resolved here" in reason
+               for _, s, reason, _ in r["skipped"])
+
+
+def test_base64_hidden_key_material():
+    """A k8s Secret carries key material base64-encoded; the plaintext rules are blind to it."""
+    import base64
+    pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAA\n-----END OPENSSH PRIVATE KEY-----\n"
+    blob = base64.b64encode(pem.encode()).decode()
+    r = write_report("sealed-secret.yaml", "data:\n  id_rsa: %s\n" % blob)
+    assert r["overall"] == 9, r["findings"]
+    assert any("base64-encoded" in lbl for _, _, lbl in r["findings"])
+
+
+def test_unquoted_values_score_the_same_as_quoted():
+    for content in ['db:\n  password: %s\n' % FAKE_ENTROPY, 'db:\n  password: "%s"\n' % FAKE_ENTROPY]:
+        assert write_report("values.yaml", content)["overall"] == 6, content
+
+
+def test_identifiers_and_urls_are_not_credentials():
+    for content in ["secretName: my-app-tls-certificate-secret",
+                    "token_url: https://login.example.com/oauth2/v2.0/token",
+                    "private_key_path: /etc/ssl/private/tls.key",
+                    "image_pull_secret: regcred-internal-registry"]:
+        assert write_report("values.yaml", content)["overall"] == 1, content
+
+
+def test_public_key_material_is_not_flagged():
+    pub = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKx3Qk1vZXhhbXBsZXB1YmxpY2tleWRhdGE demo\n"
+    assert write_report("id_ed25519.pub", pub)["overall"] == 1
 
 
 def test_gitleaks_findings_are_redacted_and_relative():

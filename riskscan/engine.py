@@ -226,6 +226,13 @@ def builtin_bash(cmd):
         if re.search(pat, cmd):
             findings.append((score, label))
             max_score = max(max_score, score)
+    # A command that puts content into version control is scored at the top of the scale by
+    # policy: the authoritative check is the pre-commit/pre-push hook, and this is the prompt
+    # that says so. Read-only git (status/log/diff/...) is unaffected — see SAFE_SUBCMDS.
+    if any(rx.search(cmd) for _, rx in GIT_SECRET_CMDS):
+        findings.append((10, "git: writes to version control (authoritative scan is the "
+                             "pre-commit/pre-push hook)"))
+        max_score = 10
     rm = rm_score(cmd)
     if rm:
         findings.append(rm)
@@ -454,78 +461,54 @@ def _git_dir_override(cmd):
     return out
 
 
-_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
-_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+# A `cd`/`pushd` ahead of the git command used to be predicted here — following literal paths,
+# expanding variables, refusing substitutions. That prediction is unbounded (subshells, `env -C`,
+# $PWD games, symlinked repos) and every gap in it is a silent false green, so it is no longer
+# attempted: the command hands off to the git hook, which git runs *inside* the right tree.
+_CD_RE = re.compile(r"^(?:cd|pushd|popd)\b")
 
 
-def _expand_vars(target, local):
-    """`$VAR` / `${VAR}` resolved from assignments earlier in the same command, falling back to
-    the hook's own environment. None when a value is not knowable without running something.
-
-    Reading variables is fine; *evaluating* the command prefix to find out would mean executing
-    an unapproved command substitution (`$(rm -rf …)`) from inside the thing meant to vet it.
-    """
-    if re.search(r"\$\(|`", target):
-        return None  # command substitution — only running it would tell us, so we don't
-
-    def sub(m):
-        name = m.group(1) or m.group(2)
-        val = local.get(name, os.environ.get(name))
-        if val is None:
-            raise KeyError(name)
-        return val
-
-    try:
-        out = _VAR_RE.sub(sub, target)
-    except KeyError:
-        return None  # not set anywhere we can see
-    return None if "$" in out else out
-
-
-def _cd_prefix(cmd):
-    """The directory a `cd`/`pushd` ahead of the git command moves into: "" for none, or
-    (None, reason) when the target cannot be resolved without executing code. Guessing is not
-    an option here — scanning the wrong tree is how this surface would report a confident
-    green for a changeset nobody looked at."""
-    frag, local = "", {}
+def _has_cd(cmd):
+    """True when a directory change may precede the git command, making the target tree a guess."""
+    # Checked before the segment walk: a subshell or `env -C` is not a segment of its own, so
+    # walking to the git command would return "no cd" and resolve the caller's tree instead.
+    if re.search(r"\(\s*(?:cd|pushd)\s|\benv\s+(?:-\S+\s+)*-C[=\s]", cmd):
+        return True
     for seg in re.split(r"&&|\|\||;", cmd):
-        seg = seg.strip()
+        seg = seg.strip().lstrip("({ ")
         if re.search(r"\bgit\s", seg):
-            break  # reached the git command; later `cd`s cannot affect it
-        assign = _ASSIGN_RE.match(seg)
-        if assign:
-            val = _expand_vars(assign.group(2).strip().strip("'\""), local)
-            if val is not None and not re.search(r"[*?]", val):
-                local[assign.group(1)] = val  # a literal assignment a later `cd` can use
+            return False
+        if _CD_RE.match(seg):
+            return True
+    return False
+
+
+HOOK_MARKER = "# >>> riskscan >>>"
+
+
+def git_hooks_installed(cwd=None):
+    """True when riskscan's own git hooks are in place, making them the authoritative scan.
+
+    The ⚪ handoff note is suppressed when they are: naming a gap that something else covers
+    is noise, not fail-loud. When they are absent the note carries an install hint instead,
+    exactly as a missing analyzer does.
+    """
+    paths = []
+    gp = _git_out(cwd or os.getcwd(), ["config", "--get", "core.hooksPath"]) if cwd else None
+    if gp and gp.strip():
+        paths.append(os.path.expanduser(gp.strip()))
+    paths.append(os.path.expanduser("~/.githooks"))
+    if cwd:
+        paths.append(os.path.join(cwd, ".git", "hooks"))
+    for d in paths:
+        f = os.path.join(d, "pre-commit")
+        try:
+            with open(f) as fh:
+                if HOOK_MARKER in fh.read():
+                    return True
+        except Exception:
             continue
-        # Capture the whole rest of the segment: a single-token match would miss
-        # `cd $(mktemp -d)` (space inside the substitution) and silently fall through to
-        # resolving the caller's tree instead.
-        m = re.match(r"^(?:cd|pushd)(?:\s+(.+))?$", seg)
-        if not m:
-            continue
-        target = m.group(1)
-        if target is None:
-            frag = os.path.expanduser("~")  # bare `cd` goes home
-            continue
-        target = target.strip()
-        if not (target[:1] in ("'", '"') or "$(" in target or "`" in target):
-            target = target.split()[0]  # cd takes the first word
-        target = target.strip("'\"")
-        if target == "-":
-            return (None, "`cd -` depends on shell history — cannot tell which tree would "
-                          "be committed")
-        if "$" in target:
-            resolved = _expand_vars(target, local)
-            if resolved is None:
-                return (None, "`cd %s` cannot be resolved without running the command — "
-                              "cannot tell which tree would be committed" % target)
-            target = resolved
-        if re.search(r"[*?]", target):
-            return (None, "`cd %s` is a glob — cannot tell which tree would be committed" % target)
-        target = os.path.expanduser(target)
-        frag = target if os.path.isabs(target) else os.path.join(frag or ".", target)
-    return (frag, None)
+    return False
 
 
 def _vcs_secret_targets(cmd, cwd):
@@ -534,20 +517,31 @@ def _vcs_secret_targets(cmd, cwd):
     if key is None:
         return []
     cwd = cwd or os.getcwd()
-    frag, cd_err = _cd_prefix(cmd)
-    if cd_err:
+
+    def unresolved(note):
+        """⚪ when nothing else covers this, silence when the git hook does.
+
+        Fail-loud means naming what was not checked — not repeating it once an authoritative
+        scan is in place. With the hooks installed, every one of these cases is scanned at
+        commit time inside the right tree, so the note would be noise rather than a warning.
+        """
+        if git_hooks_installed(cwd):
+            return []
         return [{"surface": "secrets", "mode": "vcs", "key": key, "cwd": cwd,
-                 "files": None, "note": cd_err}]
-    if frag:
-        cwd = frag if os.path.isabs(frag) else os.path.join(cwd, frag)
+                 "files": None, "note": note}]
+
+    if _has_cd(cmd):
+        return unresolved("command changes directory first — the tree is not resolved here"
+                          " → riskscan --install-git-hooks")
     override = _git_dir_override(cmd)
     if override is None:
-        return [{"surface": "secrets", "mode": "vcs", "key": key, "cwd": cwd, "files": None,
-                 "note": "command redirects git with --git-dir/--work-tree — cannot tell "
-                         "which tree would be committed"}]
+        return unresolved("command redirects git with --git-dir/--work-tree — the tree is not "
+                          "resolved here → riskscan --install-git-hooks")
     if override:
         cwd = override if os.path.isabs(override) else os.path.join(cwd, override)
     files, note, base = _git_candidates(cwd, key, cmd)
+    if files is None:
+        return unresolved(note or "the changeset could not be resolved")
     return [{"surface": "secrets", "mode": "vcs", "key": key, "cwd": base or cwd,
              "files": files, "note": note}]
 
