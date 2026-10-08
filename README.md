@@ -289,7 +289,14 @@ facts. So the two layers divide by what they can know, not by what they scan:
 python3 adapters/git_hook.py --install --global   # ~/.githooks + core.hooksPath
 python3 adapters/git_hook.py --status
 python3 adapters/git_hook.py --uninstall --global
+
+python3 scripts/demo-secrets.py          # see both layers, with and without the hooks
+python3 scripts/demo-secrets.py agent    # just the advisory layer
+python3 scripts/demo-secrets.py git      # just the blocking layer
 ```
+
+The demo builds throwaway repos, forces the hook state in-process (so the comparison is honest
+whatever your `core.hooksPath` says, and running it never changes anything), and deletes them.
 
 The global install **chains** rather than clobbers: `core.hooksPath` overrides `.git/hooks`, which
 would otherwise silently disable the pre-commit framework in every repo that uses it, so the
