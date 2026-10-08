@@ -1,7 +1,8 @@
 # riskscan
 
 A second pair of eyes for your AI coding agent. `riskscan` scores every action the
-agent proposes — a shell command, a file write, a dependency it pulls in — and prints
+agent proposes — a shell command, a file write, a dependency it pulls in, a credential
+about to be committed — and prints
 **one traffic-light banner** before it runs.
 
 It **never blocks**. It warns you, and it hands the same analysis back to the agent so
@@ -154,7 +155,7 @@ install hint) — adding one is one entry plus its binary.
 
 | Analyzer | Surface | What it adds | Install |
 |---|---|---|---|
-| **builtin** | bash, deps, py/js | zero-dependency regex rule pack (rm -rf, force-push, `kubectl delete`, `terraform destroy`, `curl\|sh`, SQL DROP, sudo, plus a python/js reverse-shell combo heuristic) | — (always on) |
+| **builtin** | bash, deps, py/js, secrets | zero-dependency regex rule pack (rm -rf, force-push, `kubectl delete`, `terraform destroy`, `curl\|sh`, SQL DROP, sudo, plus a python/js reverse-shell combo heuristic and the [secrets](#secrets--whats-about-to-enter-version-control) pack) | — (always on) |
 | **sh-guard** | bash | AST classifier with pipeline **taint analysis** + MITRE ATT&CK mapping | py3.12 lib — see `analyzers.json` |
 | **osv-scanner** | deps | CVEs from a **pinned lockfile** (unpinned manifests report ⚪) | `brew install osv-scanner` |
 | **guarddog** | deps | malicious-package heuristics (exfil, install-scripts, typosquats) | `pipx install guarddog` |
@@ -193,6 +194,83 @@ available but not yet folded in. The number a rule carries is a *policy choice* 
 opinion of how much that class of action deserves attention — versioned in a diff, not a
 model's mood.
 
+## Secrets — what's about to enter version control
+
+`git add -A` is the moment an agent can commit a credential nobody looked at, so the
+`secrets` surface scans **content, not the command**. Two entry points:
+
+- **Any file write or edit** — the written text is scanned before it reaches disk, which
+  catches the credential one step earlier than git does.
+- **A git command that moves content into version control.** At PreToolUse time nothing is
+  staged yet, so `gitleaks protect --staged` would have nothing to look at; riskscan derives
+  the candidate file set from the working tree instead.
+
+| Command | What gets scanned |
+|---|---|
+| `git add …` | `git add -n` — exactly what that pathspec would stage, `.gitignore` respected |
+| `git commit -a` | tracked files modified in the working tree |
+| `git commit` | what is already staged |
+| `git push` | files changed in `@{upstream}..HEAD` |
+
+```
+🔴 9/10 DANGER — riskscan [bash, secrets]
+  • [builtin:secrets] AWS access key id — deploy/.env:1 (staged) [9/10]
+  • [builtin:secrets] AWS secret access key — deploy/.env:2 (staged) [9/10]
+  • [builtin:secrets] connection string with inline password — deploy/.env:3 (staged) [8/10]
+```
+
+**A finding never quotes the secret.** The banner is echoed into the agent's transcript, the
+hook log and the model's context, so printing the match would create the exposure this
+surface exists to prevent. Rule label, file and line — nothing else; `tests/test_engine.py`
+asserts it.
+
+Two tiers, so interruptions land where they are earned:
+
+- **9** — an unambiguous shape: cloud key id, PEM private-key block, provider-prefixed token
+  (`ghp_`, `github_pat_`, `glpat-`, `xox…`, `sk_live_`, `AIza…`, `hvs.`, `npm_`, `SG.`). Above
+  `ask_threshold`, so it reaches the approval prompt.
+- **6** — a generic `name = value` assignment (quoted or bare — YAML and `.env` usually leave
+  the value bare, and the same credential must not score differently for its quoting) where the
+  name looks credential-ish *and* the value looks random: Shannon entropy ≥ 4.0 plus three of
+  four character classes. `password = "changeme"`, `token = "${VAULT_TOKEN}"`,
+  `{{ .Values.secret }}`, hex digests, URIs and kebab-case slugs (`my-app-tls-secret`) stay green
+  on purpose.
+
+Both tiers also run over anything **base64** hid from them — a Kubernetes `Secret`, a sealed
+manifest or a CI variable carries key material encoded, and every plaintext rule is blind to it.
+Runs of 60+ base64 chars are decoded (up to 8 per file) and rescanned, reported at the encoded
+blob's line:
+
+```
+🔴 9/10 DANGER — riskscan [bash, secrets]
+  • [builtin:secrets] private key block — id_ed25519:1 (staged) [9/10]
+  • [builtin:secrets] private key block — id_rsa_pem:1 (staged) [9/10]
+  • [builtin:secrets] private key block (base64-encoded) — sealed-secret.yaml:6 (staged) [9/10]
+  • [builtin:secrets] high-entropy value assigned to `password` — values.yaml:2 (staged) [6/10]
+```
+
+Public key material is deliberately green — `*.pub`, `known_hosts` and `ssh_config` carry no
+secret. A passphrase-protected private key is **not** green: the passphrase is brute-forcible
+once the file is in history.
+
+### Limits, in the order you'll hit them
+
+- On the git surface, fixture and vendored trees (`tests/`, `fixtures/`, `vendor/`,
+  `node_modules/`, `*.example`, lockfiles) are skipped, and the scan is capped at 40 files /
+  256KB each — tune `secrets.skip_paths` and `secrets.max_files` in config. A single-file
+  **write** is never path-skipped; the entropy gate does that job instead.
+- `git push` scans the current content of the changed files, **not** the commit history, so a
+  secret added and then removed across the unpushed range is missed. Range scanning is what
+  gitleaks' `--log-opts` is for — that's the planned follow-up.
+- The directory the changeset is resolved in follows `cd`/`pushd` ahead of the git command and
+  `git -C`, and paths are joined against the repository **root** (which is what git prints them
+  relative to), so working in a subdirectory resolves correctly.
+- A changeset it cannot read reads ⚪ NOT ANALYZED — never green. That covers: no upstream, not a
+  repo, an unparseable pathspec, `--git-dir`/`--work-tree`, and a `cd` whose target cannot be
+  resolved statically (`cd "$D"`, `cd -`). Resolving the *wrong* tree would report a confident
+  green for a changeset nobody looked at, which is strictly worse than admitting ignorance.
+- For `Edit`/`MultiEdit` the line number is relative to the edited fragment, not the file.
+
 ## Custom rules
 
 Add or override built-in rules without touching code: copy
@@ -200,9 +278,10 @@ Add or override built-in rules without touching code: copy
 
 ```json
 {
-  "bash":   [ ["\\bnpm\\s+publish\\b", 7, "npm publish (releases a package)"] ],
-  "python": [ ["\\brequests\\.post\\s*\\(", 4, "outbound POST"] ],
-  "js":     []
+  "bash":    [ ["\\bnpm\\s+publish\\b", 7, "npm publish (releases a package)"] ],
+  "python":  [ ["\\brequests\\.post\\s*\\(", 4, "outbound POST"] ],
+  "js":      [],
+  "secrets": [ ["\\bINTERNAL-[A-Z0-9]{12}\\b", 9, "internal service credential"] ]
 }
 ```
 

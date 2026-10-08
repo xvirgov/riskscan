@@ -1,6 +1,6 @@
 {
   "builtin": {
-    "surfaces": ["bash", "deps", "python", "js", "ts"],
+    "surfaces": ["bash", "deps", "python", "js", "ts", "secrets"],
     "builtin": true,
     "network": false
   },

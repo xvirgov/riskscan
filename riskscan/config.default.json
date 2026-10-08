@@ -3,6 +3,15 @@
   "on_missing": "suggest",
   "quiet_safe": false,
   "ask_threshold": 7,
+  "secrets": {
+    "max_files": 40,
+    "skip_paths": [
+      "(^|/)\\.git/",
+      "(^|/)(tests?|testdata|fixtures?|__snapshots__|vendor|node_modules|\\.venv|venv|dist|build)/",
+      "\\.(example|sample|dist|template|tpl)(\\.|$)",
+      "(^|/)(package-lock\\.json|yarn\\.lock|pnpm-lock\\.yaml|poetry\\.lock|go\\.sum|Cargo\\.lock)$"
+    ]
+  },
   "analyzers": {
     "builtin": { "enabled": true },
     "sh-guard": { "enabled": false },

@@ -8,6 +8,7 @@ green (safe) / yellow (caution) / red (danger) / white (NOT ANALYZED).
 safe. This module knows nothing about any specific agent runtime — the mapping
 from a runtime's tool call to an `action` lives in an adapter (see adapters/).
 """
+import base64
 import json
 import math
 import os
@@ -148,10 +149,13 @@ LANG_BY_EXT = {
 
 
 # ── normalized action → analysis targets ─────────────────────────────────────
-def make_action(kind, command=None, file_path=None, content=None):
+def make_action(kind, command=None, file_path=None, content=None, cwd=None):
     """A runtime-neutral description of a proposed action.
-    kind: "command" (a shell command) or "write" (create/modify a file)."""
-    return {"kind": kind, "command": command, "file_path": file_path, "content": content}
+    kind: "command" (a shell command) or "write" (create/modify a file).
+    cwd: the directory the command would run in — needed to resolve what a
+    `git add`/`commit`/`push` would actually put into version control."""
+    return {"kind": kind, "command": command, "file_path": file_path,
+            "content": content, "cwd": cwd}
 
 
 def rm_score(cmd):
@@ -196,11 +200,16 @@ def targets_from_action(action):
                 if code:
                     ext = "py" if lang == "python" else "js"
                     targets.append({"surface": lang, "content": code, "file_path": "inline." + ext, "inline": True})
+        targets += _vcs_secret_targets(cmd, action.get("cwd"))
     elif kind == "write":
         fp = action.get("file_path") or ""
         content = action.get("content") or ""
         base = os.path.basename(fp)
         ext = os.path.splitext(fp)[1].lower()
+        if content:
+            # Any file can carry a credential, so this is not limited by extension — and it
+            # catches the secret one step earlier than the git surface does.
+            targets.append({"surface": "secrets", "mode": "write", "file_path": fp, "content": content})
         if base in MANIFESTS:
             targets.append({"surface": "deps", "ecosystem": MANIFESTS[base], "packages": [], "manifest": fp, "content": content, "persisted": True})
         lang = LANG_BY_EXT.get(ext)
@@ -286,10 +295,377 @@ JS_RULES = [
 ]
 
 
+# ── secrets: credential material about to be written or committed ────────────
+# Two tiers on purpose. A token whose *shape* is unambiguous (cloud key id, PEM block,
+# provider-prefixed token) scores 9 and will force the prompt; a generic high-entropy
+# assignment scores 6, which informs the model without interrupting the user.
+#
+# A finding NEVER carries the matched text. The banner is echoed into the transcript,
+# the hook log and the model's context, so printing the secret would create the very
+# exposure this surface exists to prevent. Rule label + file + line, nothing else.
+SECRET_RULES = [
+    (r"\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b", 9, "AWS access key id"),
+    (r"(?i)aws_secret_access_key\s*[=:]\s*[\"']?[A-Za-z0-9/+=]{40}", 9, "AWS secret access key"),
+    (r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY(?: BLOCK)?-----", 9, "private key block"),
+    (r"\bgh[pousr]_[A-Za-z0-9]{36,}\b", 9, "GitHub token"),
+    (r"\bgithub_pat_[A-Za-z0-9_]{30,}\b", 9, "GitHub fine-grained PAT"),
+    (r"\bglpat-[A-Za-z0-9_\-]{20,}\b", 9, "GitLab personal access token"),
+    (r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b", 9, "Slack token"),
+    (r"\bsk_live_[A-Za-z0-9]{20,}\b", 9, "Stripe live secret key"),
+    (r"\bAIza[0-9A-Za-z_\-]{35}\b", 9, "Google API key"),
+    (r"\bsk-(?:proj-|ant-api\d\d-)?[A-Za-z0-9_\-]{32,}\b", 9, "LLM provider API key"),
+    (r"\bSG\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{40,}\b", 9, "SendGrid API key"),
+    (r"\bhvs\.[A-Za-z0-9_\-]{24,}\b", 9, "Vault service token"),
+    (r"\bdop_v1_[a-f0-9]{64}\b", 9, "DigitalOcean token"),
+    (r"\bnpm_[A-Za-z0-9]{36}\b", 9, "npm access token"),
+    (r"(?i)\"type\"\s*:\s*\"service_account\"", 8, "GCP service-account key material"),
+    (r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqps?)://[^\s:@/]+:[^\s:@/]{4,}@",
+     8, "connection string with inline password"),
+    (r"(?i)\bauthorization\s*[=:]\s*[\"']?(?:bearer|basic)\s+[A-Za-z0-9_\-./+=]{16,}",
+     7, "hardcoded Authorization header"),
+    (r"\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}", 6, "JWT"),
+]
+
+# Generic `name = value` credentials, quoted or not — YAML and .env files usually leave the
+# value bare, and the same credential must not score differently for its quoting. The name
+# alone is never enough: randomness is what separates a token from `password = "changeme"`.
+SECRET_ASSIGN = re.compile(
+    r"(?i)\b([a-z0-9_\-.]*(?:pass(?:wd|word)?|secret|token|api[_\-]?key|apikey|access[_\-]?key"
+    r"|client[_\-]?secret|private[_\-]?key|credentials?|auth[_\-]?key)[a-z0-9_\-.]*)"
+    r"\s*[=:]\s*(?:[\"']([^\"'\n]{16,200})[\"']|([^\s\"'\n]{16,200}))")
+_PLACEHOLDER = re.compile(
+    r"(?i)^(?:\$|\{\{|<|%|x{4,}|\*{4,}|redacted|changeme|change[_\-]?me|example|placeholder"
+    r"|dummy|sample|fake|test|your|insert|todo|tbd|none|null|n/?a|secret|password|token)")
+_TEMPLATED = re.compile(r"\$\{|\{\{|\$\(|<%|%\(|\$[A-Z_]{3,}")
+
+# Volume limits: this surface can be handed a whole changeset, and the hook is synchronous.
+SECRET_MAX_FILES = 40
+SECRET_MAX_BYTES = 256 * 1024
+SECRET_SKIP_EXT = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".svg", ".pdf", ".zip", ".gz", ".tgz",
+    ".bz2", ".xz", ".7z", ".jar", ".war", ".whl", ".so", ".dylib", ".dll", ".o", ".a", ".class",
+    ".pyc", ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".mov", ".mp3", ".wav", ".parquet", ".db",
+}
+# Paths skipped on the git surface only (not on a single-file write): fixture and vendored
+# trees are where a changeset's false positives come from. Tunable via config "secrets".
+SECRET_SKIP_PATHS = [
+    r"(^|/)\.git/",
+    r"(^|/)(tests?|testdata|fixtures?|__snapshots__|vendor|node_modules|\.venv|venv|dist|build)/",
+    r"\.(example|sample|dist|template|tpl)(\.|$)",
+    r"(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|go\.sum|Cargo\.lock)$",
+]
+
+# ── what a git command is about to put into version control ──────────────────
+# At PreToolUse time nothing is staged yet, so `gitleaks protect --staged` has nothing to
+# look at: the candidate file set has to be derived from the working tree instead. Keys are
+# tried in this order and the first match wins — in an `add && commit && push` chain the
+# staging step is the broadest read of the new content.
+_GIT_PRE = (r"(?:-C\s+\S+\s+|-c\s+\S+\s+|--no-pager\s+|--git-dir[=\s]\S+\s+"
+            r"|--work-tree[=\s]\S+\s+)*")
+GIT_SECRET_CMDS = [
+    ("add", re.compile(r"\bgit\s+" + _GIT_PRE + r"add\b")),
+    ("worktree", re.compile(r"\bgit\s+" + _GIT_PRE + r"commit\b[^\n|;&]*?(?:\s--all\b|\s-[A-Za-z]*a)")),
+    ("staged", re.compile(r"\bgit\s+" + _GIT_PRE + r"commit\b")),
+    ("push", re.compile(r"\bgit\s+" + _GIT_PRE + r"push\b")),
+]
+GIT_SECRET_LABEL = {"add": "staged", "worktree": "commit -a", "staged": "staged", "push": "push"}
+
+
+def _git_out(cwd, args, timeout=10):
+    """Run a read-only git command in cwd; stdout on success, None on any failure."""
+    try:
+        p = subprocess.run(["git", "-C", cwd] + args, capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+def _add_pathspecs(cmd):
+    """Explicit pathspecs on a `git add`, so git resolves those rather than the whole tree."""
+    m = re.search(r"\bgit\s+" + _GIT_PRE + r"add\b(.*)", cmd)
+    if not m:
+        return []
+    out = []
+    for tok in m.group(1).split():
+        if tok in ("&&", "||", ";", "|", "&"):
+            break
+        if tok == "--" or tok.startswith("-"):
+            continue
+        if re.search(r"[<>$`*?\[\]]", tok):
+            return []  # glob or substitution — ask git about the whole tree instead
+        out.append(tok.strip("'\""))
+    return out[:20]
+
+
+def _git_candidates(cwd, key, cmd):
+    """(paths, None, base) about to enter git, or (None, reason, None) when unknowable.
+
+    git prints these paths relative to the repository ROOT, not to the directory it ran in,
+    so `base` is the toplevel — joining against `cwd` silently breaks whenever the agent is
+    working in a subdirectory, which is most of the time.
+    """
+    if not cwd or not os.path.isdir(cwd):
+        return (None, "no working directory to resolve the changeset in", None)
+    if _git_out(cwd, ["rev-parse", "--git-dir"]) is None:
+        return (None, "not a git repository", None)
+    top = _git_out(cwd, ["rev-parse", "--show-toplevel"])
+    base = top.strip() if top and top.strip() else cwd
+    filt = ["--diff-filter=ACMR", "--name-only"]  # added/copied/modified/renamed — content that lands
+    if key == "add":
+        specs = _add_pathspecs(cmd)
+        out = _git_out(cwd, ["add", "-n", "--"] + specs) if specs else _git_out(cwd, ["add", "-n", "-A"])
+        if out is None:
+            return (None, "`git add -n` failed (ignored or unmatched pathspec)", None)
+        return ([m.group(1) for m in re.finditer(r"^add '(.*)'$", out, re.M)], None, base)
+    if key == "worktree":
+        out = _git_out(cwd, ["diff"] + filt)
+    elif key == "staged":
+        out = _git_out(cwd, ["diff", "--cached"] + filt)
+    else:  # push — the commits not yet on the upstream branch
+        up = _git_out(cwd, ["rev-parse", "--abbrev-ref", "@{upstream}"])
+        if not up:
+            return (None, "branch has no upstream — cannot tell which commits would be pushed", None)
+        out = _git_out(cwd, ["diff"] + filt + ["%s..HEAD" % up.strip()])
+    if out is None:
+        return (None, "`git diff` failed", None)
+    return ([ln for ln in out.splitlines() if ln.strip()], None, base)
+
+
+def _git_dir_override(cmd):
+    """Where a `git -C <path>` points: "" for none, None when git is aimed somewhere we
+    cannot follow. Resolving the wrong tree would be worse than not resolving one at all —
+    it reads as a green for a changeset nobody looked at."""
+    m = re.search(r"\bgit\s+(.*)", cmd)
+    if not m:
+        return ""
+    toks, out, i = m.group(1).split(), "", 0
+    while i < len(toks):
+        t = toks[i]
+        if t == "-C" and i + 1 < len(toks):
+            out = toks[i + 1].strip("'\"")
+            i += 2
+            continue
+        if t.startswith("--git-dir") or t.startswith("--work-tree"):
+            return None
+        if t.startswith("-"):
+            i += 1
+            continue
+        break  # first non-flag token is the subcommand
+    return out
+
+
+def _cd_prefix(cmd):
+    """The directory a `cd`/`pushd` ahead of the git command moves into: "" for none, or
+    (None, reason) when the target cannot be resolved statically (a shell variable, `cd -`,
+    a glob). Guessing is not an option here — scanning the wrong tree is how this surface
+    would report a confident green for a changeset nobody looked at."""
+    frag = ""
+    for seg in re.split(r"&&|\|\||;", cmd):
+        seg = seg.strip()
+        if re.search(r"\bgit\s", seg):
+            break  # reached the git command; later `cd`s cannot affect it
+        m = re.match(r"^(?:cd|pushd)(?:\s+(\S+))?$", seg)
+        if not m:
+            continue
+        target = m.group(1)
+        if target is None:
+            frag = os.path.expanduser("~")  # bare `cd` goes home
+            continue
+        target = target.strip("'\"")
+        if target == "-" or re.search(r"[$`*?]", target):
+            return (None, "`cd %s` cannot be resolved statically — cannot tell which tree "
+                          "would be committed" % target)
+        target = os.path.expanduser(target)
+        frag = target if os.path.isabs(target) else os.path.join(frag or ".", target)
+    return (frag, None)
+
+
+def _vcs_secret_targets(cmd, cwd):
+    """A `secrets` target for a command that moves content into version control."""
+    key = next((k for k, rx in GIT_SECRET_CMDS if rx.search(cmd)), None)
+    if key is None:
+        return []
+    cwd = cwd or os.getcwd()
+    frag, cd_err = _cd_prefix(cmd)
+    if cd_err:
+        return [{"surface": "secrets", "mode": "vcs", "key": key, "cwd": cwd,
+                 "files": None, "note": cd_err}]
+    if frag:
+        cwd = frag if os.path.isabs(frag) else os.path.join(cwd, frag)
+    override = _git_dir_override(cmd)
+    if override is None:
+        return [{"surface": "secrets", "mode": "vcs", "key": key, "cwd": cwd, "files": None,
+                 "note": "command redirects git with --git-dir/--work-tree — cannot tell "
+                         "which tree would be committed"}]
+    if override:
+        cwd = override if os.path.isabs(override) else os.path.join(cwd, override)
+    files, note, base = _git_candidates(cwd, key, cmd)
+    return [{"surface": "secrets", "mode": "vcs", "key": key, "cwd": base or cwd,
+             "files": files, "note": note}]
+
+
+def _entropy(s):
+    """Shannon entropy in bits/char — a proxy for "is this value random"."""
+    if not s:
+        return 0.0
+    counts = {}
+    for ch in s:
+        counts[ch] = counts.get(ch, 0) + 1
+    n = float(len(s))
+    return -sum((c / n) * math.log(c / n, 2) for c in counts.values())
+
+
+def _looks_random(value):
+    """A credential-shaped value — not a placeholder, a reference, a URI or an identifier."""
+    if _PLACEHOLDER.match(value) or _TEMPLATED.search(value):
+        return False  # a placeholder, or a reference resolved elsewhere (env/vault/helm)
+    if re.match(r"^[a-z][a-z0-9+.\-]*://", value) or re.match(r"^[~./]", value):
+        return False  # a URI or path; credentials *inside* a URI have their own rule
+    if re.match(r"^[a-f0-9]+$", value) or value.isdigit():
+        return False  # a hash or id — costs a few real hex keys, kills integrity-digest noise
+    classes = sum(bool(re.search(c, value)) for c in (r"[a-z]", r"[A-Z]", r"\d", r"[^A-Za-z0-9]"))
+    if classes < 3 and _entropy(value) < 4.5:
+        return False  # kebab-case slugs (`my-app-tls-secret`) read as text, not key material
+    return _entropy(value) >= 4.0
+
+
+_B64_RUN = re.compile(r"[A-Za-z0-9+/]{60,}={0,2}")
+
+
+def _b64_spans(text, limit=8):
+    """Decoded payloads of base64-looking runs. Kubernetes Secrets, sealed manifests and CI
+    variables carry key material this way, and every plaintext rule is blind to it."""
+    out = []
+    for m in _B64_RUN.finditer(text):
+        if len(out) >= limit:
+            break
+        blob = m.group(0)
+        if len(blob) > 200000:
+            continue
+        try:
+            raw = base64.b64decode(blob + "=" * (-len(blob) % 4), validate=True)
+        except Exception:
+            continue
+        if b"\0" in raw[:4000]:
+            continue
+        dec = raw.decode("utf-8", "replace")[:200000]
+        head = dec[:4000]
+        if head and sum(1 for c in head if c.isprintable() or c in "\n\r\t") / float(len(head)) > 0.9:
+            out.append((m.start(), dec))
+    return out
+
+
+def _secret_scan(text, where=""):
+    """(score, findings) for one blob. Location-only reporting — see SECRET_RULES."""
+    if not text:
+        return (0, [])
+    hits = {}  # label -> (score, first line, count)
+
+    def note(label, score, start):
+        line = text.count("\n", 0, start) + 1
+        prev = hits.get(label)
+        hits[label] = (score, prev[1] if prev else line, (prev[2] if prev else 0) + 1)
+
+    for pat, score, label in SECRET_RULES:
+        for m in re.finditer(pat, text):
+            note(label, score, m.start())
+    for m in SECRET_ASSIGN.finditer(text):
+        if _looks_random(m.group(2) or m.group(3) or ""):
+            note("high-entropy value assigned to `%s`" % m.group(1).lower()[:40], 6, m.start())
+    # Same rules over anything base64 hid from them, reported at the encoded blob's line.
+    for start, dec in _b64_spans(text):
+        for pat, score, label in SECRET_RULES:
+            if re.search(pat, dec):
+                note(label + " (base64-encoded)", score, start)
+        for m in SECRET_ASSIGN.finditer(dec):
+            if _looks_random(m.group(2) or m.group(3) or ""):
+                note("high-entropy value assigned to `%s` (base64-encoded)"
+                     % m.group(1).lower()[:40], 6, start)
+    findings = []
+    for label, (score, line, count) in hits.items():
+        loc = "%s:%d" % (where, line) if where else "line %d" % line
+        findings.append((score, "%s — %s%s" % (label, loc, " (+%d more)" % (count - 1) if count > 1 else "")))
+    findings.sort(key=lambda f: -f[0])
+    return (max((f[0] for f in findings), default=0), findings)
+
+
+def _secret_skip(path, patterns):
+    low = path.replace("\\", "/")
+    if os.path.splitext(low)[1].lower() in SECRET_SKIP_EXT:
+        return True
+    return any(re.search(p, low) for p in patterns)
+
+
+def _read_text(path):
+    """File contents as text, or None when it is binary, oversized or unreadable."""
+    try:
+        if os.path.getsize(path) > SECRET_MAX_BYTES:
+            return None
+        with open(path, "rb") as f:
+            raw = f.read()
+    except Exception:
+        return None
+    if b"\0" in raw[:8000]:
+        return None
+    return raw.decode("utf-8", "replace")
+
+
+def builtin_secrets(t, config=None):
+    """Scan content about to be written, or committed/pushed, for credential material.
+
+    Returns (score, findings, notes). `score` is None when the content could not be
+    determined at all, so the caller surfaces ⚪ NOT ANALYZED rather than a green;
+    `notes` are partial-coverage reasons shown even alongside real findings.
+    """
+    if t.get("mode") == "write":
+        sc, fs = _secret_scan(t.get("content") or "", os.path.basename(t.get("file_path") or ""))
+        return (sc, fs, []) if fs else (1, [(1, "no credential pattern in the written content")], [])
+
+    files = t.get("files")
+    if files is None:
+        return (None, [], [t.get("note") or "could not determine which files would be committed"])
+    cfg = (config or {}).get("secrets") or {}
+    skips = cfg.get("skip_paths", SECRET_SKIP_PATHS)
+    cap = int(cfg.get("max_files", SECRET_MAX_FILES))
+    cwd, where = t.get("cwd") or "", GIT_SECRET_LABEL.get(t.get("key"), "git")
+    hits, notes, unreadable, missing, scanned = [], [], [], [], 0
+    worst = 0
+    for i, rel in enumerate(files):
+        if _secret_skip(rel, skips):
+            continue
+        if scanned >= cap:
+            notes.append("%d of %d file(s) past the %d-file scan cap — not scanned"
+                         % (len(files) - i, len(files), cap))
+            break
+        full = os.path.join(cwd, rel)
+        if not os.path.isfile(full):
+            missing.append(rel)
+            continue
+        text = _read_text(full)
+        if text is None:
+            unreadable.append(rel)
+            continue
+        scanned += 1
+        sc, fs = _secret_scan(text, rel)
+        if fs:
+            worst = max(worst, sc)
+            hits += fs
+    if unreadable:
+        notes.append("%d file(s) unreadable as text (binary or >%dKB): %s"
+                     % (len(unreadable), SECRET_MAX_BYTES // 1024, ", ".join(unreadable[:3])))
+    if missing:
+        notes.append("%d file(s) git listed could not be located under %s: %s"
+                     % (len(missing), cwd or "?", ", ".join(missing[:3])))
+    if not hits:
+        return (1, [(1, "no credential pattern in %d file(s) to %s" % (scanned, where))], notes)
+    shown = hits[:6] + ([(1, "+%d more location(s)" % (len(hits) - 6))] if len(hits) > 6 else [])
+    return (worst, [(s, "%s (%s)" % (lbl, where)) for s, lbl in shown], notes)
+
+
 def _load_custom_rules():
     """Merge user rules from custom_rules.json (if present), so adding a rule needs no code edit.
 
-    Format: {"bash": [["regex", 7, "label"], ...], "python": [...], "js": [...]}.
+    Format: {"bash": [["regex", 7, "label"], ...], "python": [...], "js": [...], "secrets": [...]}.
     Rules are appended to the built-in packs; since the highest score wins, a custom rule can
     only *raise* an action's score, never mask a built-in one. Bad entries are skipped, never fatal.
     """
@@ -306,13 +682,15 @@ def _load_custom_rules():
                 continue
         return out
 
-    return conv(data.get("bash")), conv(data.get("python")), conv(data.get("js"))
+    return (conv(data.get("bash")), conv(data.get("python")), conv(data.get("js")),
+            conv(data.get("secrets")))
 
 
-_custom_bash, _custom_py, _custom_js = _load_custom_rules()
+_custom_bash, _custom_py, _custom_js, _custom_secrets = _load_custom_rules()
 BASH_RULES += _custom_bash
 PY_RULES += _custom_py
 JS_RULES += _custom_js
+SECRET_RULES += _custom_secrets
 
 
 def _rule_scan(code, rules, empty_label):
@@ -684,6 +1062,16 @@ def analyze(action, config=None, registry=None):
                 elif surf in ("js", "ts"):
                     sc, fs = builtin_js(t.get("content", ""))
                     satisfied.add(surf)
+                elif surf == "secrets":
+                    sc, fs, notes = builtin_secrets(t, config)
+                    if on_missing != "silent":
+                        skipped += [(name, surf, reason, "") for reason in notes]
+                    if sc is None:
+                        # It ran but could not read the changeset; the ⚪ reason is already
+                        # surfaced, and `secrets` stays unsatisfied so nothing masks it.
+                        ran_any = True
+                        continue
+                    satisfied.add("secrets")
                 else:  # deps — informational only, does NOT satisfy the vuln check
                     sc, fs = builtin_deps(t)
                 src = "%s:%s" % (name, surf)  # e.g. builtin:python — name the rule pack

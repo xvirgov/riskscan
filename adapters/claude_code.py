@@ -38,8 +38,9 @@ def action_from_payload(payload):
     """Map a Claude Code hook payload to an engine action, or None to opt out."""
     tool = payload.get("tool_name", "")
     ti = payload.get("tool_input", {}) or {}
+    cwd = payload.get("cwd") or None  # resolves what a `git add`/`commit`/`push` would include
     if tool == "Bash":
-        return engine.make_action("command", command=ti.get("command", "") or "")
+        return engine.make_action("command", command=ti.get("command", "") or "", cwd=cwd)
     if tool in ("Write", "Edit"):
         return engine.make_action(
             "write",
