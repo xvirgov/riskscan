@@ -232,14 +232,41 @@ def test_cd_before_git_is_followed():
         shutil.rmtree(clean, ignore_errors=True)
 
 
-def test_unresolvable_cd_is_not_analyzed():
-    """A `cd` into a shell variable is unfollowable — that must read ⚪, not the caller's tree."""
+def test_shell_variables_are_resolved_where_possible():
+    """A literal assignment earlier in the same command, or a variable in the environment, is
+    resolvable without executing anything — so `D=<repo> && cd "$D" && git add` must be scanned."""
+    secret = _git_repo("aws_access_key_id: %s\n" % FAKE_AWS)
     clean = _git_repo("clean: true\n", filename="ok.yaml")
     try:
-        for cmd in ['cd "$D" && git add -A', "cd - && git add -A", "cd $HOME/x && git add -A"]:
+        for cmd in ['D=%s && cd "$D" && git add -A' % secret,
+                    'REPO=%s; cd ${REPO} && git add -A' % secret]:
             r = report(cmd, cwd=clean)
-            assert any(s == "secrets" and "cannot be resolved statically" in reason
-                       for _, s, reason, _ in r["skipped"]), cmd
+            assert r["overall"] == 9, (cmd, r["findings"])
+        os.environ["RISKSCAN_TEST_REPO"] = secret
+        try:
+            r = report('cd "$RISKSCAN_TEST_REPO" && git add -A', cwd=clean)
+            assert r["overall"] == 9, r["findings"]
+        finally:
+            del os.environ["RISKSCAN_TEST_REPO"]
+    finally:
+        shutil.rmtree(secret, ignore_errors=True)
+        shutil.rmtree(clean, ignore_errors=True)
+
+
+def test_cd_that_needs_execution_is_not_analyzed():
+    """What is left after static resolution: command substitution, shell history, globs.
+    Evaluating those would mean running an unapproved command to vet it — so they read ⚪,
+    never the caller's tree."""
+    clean = _git_repo("clean: true\n", filename="ok.yaml")
+    try:
+        cases = [("cd $(mktemp -d) && git add -A", "without running the command"),
+                 ('cd "$RISKSCAN_DEFINITELY_UNSET" && git add -A', "without running the command"),
+                 ("cd - && git add -A", "shell history"),
+                 ("cd /tmp/build-* && git add -A", "is a glob")]
+        for cmd, expect in cases:
+            r = report(cmd, cwd=clean)
+            assert any(s == "secrets" and expect in reason
+                       for _, s, reason, _ in r["skipped"]), (cmd, r["skipped"])
             assert not any(n == "builtin:secrets" and "no credential pattern" in lbl
                            for n, _, lbl in r["findings"]), cmd
     finally:

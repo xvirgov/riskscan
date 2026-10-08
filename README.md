@@ -265,10 +265,15 @@ once the file is in history.
 - The directory the changeset is resolved in follows `cd`/`pushd` ahead of the git command and
   `git -C`, and paths are joined against the repository **root** (which is what git prints them
   relative to), so working in a subdirectory resolves correctly.
+- `$VAR` in a `cd` target is resolved from a literal assignment earlier in the same command
+  (`D=/srv/app && cd "$D" && git add -A`) or from the hook's own environment. Reading variables
+  is free; *evaluating* the prefix to find out would mean executing an unapproved command
+  substitution from inside the thing meant to vet it, so that line is not crossed.
 - A changeset it cannot read reads ⚪ NOT ANALYZED — never green. That covers: no upstream, not a
-  repo, an unparseable pathspec, `--git-dir`/`--work-tree`, and a `cd` whose target cannot be
-  resolved statically (`cd "$D"`, `cd -`). Resolving the *wrong* tree would report a confident
-  green for a changeset nobody looked at, which is strictly worse than admitting ignorance.
+  repo, an unparseable pathspec, `--git-dir`/`--work-tree`, and the `cd` targets that genuinely
+  need execution — command substitution (`cd $(mktemp -d)`), an unset variable, `cd -`, a glob.
+  Resolving the *wrong* tree would report a confident green for a changeset nobody looked at,
+  which is strictly worse than admitting ignorance.
 - For `Edit`/`MultiEdit` the line number is relative to the edited fragment, not the file.
 
 ## Custom rules

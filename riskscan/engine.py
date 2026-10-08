@@ -454,27 +454,75 @@ def _git_dir_override(cmd):
     return out
 
 
+_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _expand_vars(target, local):
+    """`$VAR` / `${VAR}` resolved from assignments earlier in the same command, falling back to
+    the hook's own environment. None when a value is not knowable without running something.
+
+    Reading variables is fine; *evaluating* the command prefix to find out would mean executing
+    an unapproved command substitution (`$(rm -rf …)`) from inside the thing meant to vet it.
+    """
+    if re.search(r"\$\(|`", target):
+        return None  # command substitution — only running it would tell us, so we don't
+
+    def sub(m):
+        name = m.group(1) or m.group(2)
+        val = local.get(name, os.environ.get(name))
+        if val is None:
+            raise KeyError(name)
+        return val
+
+    try:
+        out = _VAR_RE.sub(sub, target)
+    except KeyError:
+        return None  # not set anywhere we can see
+    return None if "$" in out else out
+
+
 def _cd_prefix(cmd):
     """The directory a `cd`/`pushd` ahead of the git command moves into: "" for none, or
-    (None, reason) when the target cannot be resolved statically (a shell variable, `cd -`,
-    a glob). Guessing is not an option here — scanning the wrong tree is how this surface
-    would report a confident green for a changeset nobody looked at."""
-    frag = ""
+    (None, reason) when the target cannot be resolved without executing code. Guessing is not
+    an option here — scanning the wrong tree is how this surface would report a confident
+    green for a changeset nobody looked at."""
+    frag, local = "", {}
     for seg in re.split(r"&&|\|\||;", cmd):
         seg = seg.strip()
         if re.search(r"\bgit\s", seg):
             break  # reached the git command; later `cd`s cannot affect it
-        m = re.match(r"^(?:cd|pushd)(?:\s+(\S+))?$", seg)
+        assign = _ASSIGN_RE.match(seg)
+        if assign:
+            val = _expand_vars(assign.group(2).strip().strip("'\""), local)
+            if val is not None and not re.search(r"[*?]", val):
+                local[assign.group(1)] = val  # a literal assignment a later `cd` can use
+            continue
+        # Capture the whole rest of the segment: a single-token match would miss
+        # `cd $(mktemp -d)` (space inside the substitution) and silently fall through to
+        # resolving the caller's tree instead.
+        m = re.match(r"^(?:cd|pushd)(?:\s+(.+))?$", seg)
         if not m:
             continue
         target = m.group(1)
         if target is None:
             frag = os.path.expanduser("~")  # bare `cd` goes home
             continue
+        target = target.strip()
+        if not (target[:1] in ("'", '"') or "$(" in target or "`" in target):
+            target = target.split()[0]  # cd takes the first word
         target = target.strip("'\"")
-        if target == "-" or re.search(r"[$`*?]", target):
-            return (None, "`cd %s` cannot be resolved statically — cannot tell which tree "
-                          "would be committed" % target)
+        if target == "-":
+            return (None, "`cd -` depends on shell history — cannot tell which tree would "
+                          "be committed")
+        if "$" in target:
+            resolved = _expand_vars(target, local)
+            if resolved is None:
+                return (None, "`cd %s` cannot be resolved without running the command — "
+                              "cannot tell which tree would be committed" % target)
+            target = resolved
+        if re.search(r"[*?]", target):
+            return (None, "`cd %s` is a glob — cannot tell which tree would be committed" % target)
         target = os.path.expanduser(target)
         frag = target if os.path.isabs(target) else os.path.join(frag or ".", target)
     return (frag, None)
