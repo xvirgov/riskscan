@@ -669,19 +669,39 @@ def builtin_secrets(t, config=None):
         sc, fs = _secret_scan(t.get("content") or "", os.path.basename(t.get("file_path") or ""))
         return (sc, fs, []) if fs else (1, [(1, "no credential pattern in the written content")], [])
 
+    items, notes = _secret_file_set(t, config)
+    if items is None:
+        return (None, [], notes)
+    where = GIT_SECRET_LABEL.get(t.get("key"), "git")
+    hits, worst = [], 0
+    for rel, text in items:
+        sc, fs = _secret_scan(text, rel)
+        if fs:
+            worst = max(worst, sc)
+            hits += fs
+    if not hits:
+        return (1, [(1, "no credential pattern in %d file(s) to %s" % (len(items), where))], notes)
+    shown = hits[:6] + ([(1, "+%d more location(s)" % (len(hits) - 6))] if len(hits) > 6 else [])
+    return (worst, [(s, "%s (%s)" % (lbl, where)) for s, lbl in shown], notes)
+
+
+def _secret_file_set(t, config=None):
+    """((relpath, text) for each file in the changeset, notes), or (None, notes) when the
+    changeset is unknowable. Shared by every `secrets` analyzer so they all see exactly the
+    same slice and produce the same ⚪ reasons — two analyzers disagreeing about *which files*
+    they looked at would make the banner unreadable."""
     files = t.get("files")
     if files is None:
-        return (None, [], [t.get("note") or "could not determine which files would be committed"])
+        return (None, [t.get("note") or "could not determine which files would be committed"])
     cfg = (config or {}).get("secrets") or {}
     skips = cfg.get("skip_paths", SECRET_SKIP_PATHS)
     cap = int(cfg.get("max_files", SECRET_MAX_FILES))
-    cwd, where = t.get("cwd") or "", GIT_SECRET_LABEL.get(t.get("key"), "git")
-    hits, notes, unreadable, missing, scanned = [], [], [], [], 0
-    worst = 0
+    cwd = t.get("cwd") or ""
+    items, notes, unreadable, missing = [], [], [], []
     for i, rel in enumerate(files):
         if _secret_skip(rel, skips):
             continue
-        if scanned >= cap:
+        if len(items) >= cap:
             notes.append("%d of %d file(s) past the %d-file scan cap — not scanned"
                          % (len(files) - i, len(files), cap))
             break
@@ -693,21 +713,14 @@ def builtin_secrets(t, config=None):
         if text is None:
             unreadable.append(rel)
             continue
-        scanned += 1
-        sc, fs = _secret_scan(text, rel)
-        if fs:
-            worst = max(worst, sc)
-            hits += fs
+        items.append((rel, text))
     if unreadable:
         notes.append("%d file(s) unreadable as text (binary or >%dKB): %s"
                      % (len(unreadable), SECRET_MAX_BYTES // 1024, ", ".join(unreadable[:3])))
     if missing:
         notes.append("%d file(s) git listed could not be located under %s: %s"
                      % (len(missing), cwd or "?", ", ".join(missing[:3])))
-    if not hits:
-        return (1, [(1, "no credential pattern in %d file(s) to %s" % (scanned, where))], notes)
-    shown = hits[:6] + ([(1, "+%d more location(s)" % (len(hits) - 6))] if len(hits) > 6 else [])
-    return (worst, [(s, "%s (%s)" % (lbl, where)) for s, lbl in shown], notes)
+    return (items, notes)
 
 
 def _load_custom_rules():
@@ -1055,6 +1068,90 @@ def run_guarddog(spec, t):
         return ("skip", "error: %s" % e, "")
 
 
+# gitleaks has no mode for "files that *would* be staged" — `--staged` reads the index, which is
+# still empty at PreToolUse time. So we materialize the resolved changeset into a tempdir and use
+# `gitleaks dir`, which also makes the write surface and all four git keys take one code path.
+# `--redact` is not optional: it keeps the credential out of the report, and therefore out of this
+# process, the banner and the model's context. Exit status 1 means "leaks found", not "failed".
+GL_GENERIC = 6  # entropy-driven rules — same tier as the builtin's generic assignment rule
+
+
+def _gl_score(rule_id):
+    r = (rule_id or "").lower()
+    if "private-key" in r or "private_key" in r:
+        return 9
+    if r.startswith("generic"):
+        return GL_GENERIC
+    return 9  # a named provider rule is a specific credential shape, like the builtin's tier-1
+
+
+def parse_gitleaks(out):
+    """gitleaks JSON report → (score, findings). Reads RuleID/File/StartLine only: `Secret` and
+    `Match` carry the credential itself and must never reach a finding."""
+    try:
+        d = json.loads(out or "[]")
+    except Exception:
+        return None
+    if not isinstance(d, list):
+        return None
+    if not d:
+        return (1, [(1, "no findings")])
+    hits, worst = [], 0
+    for f in d:
+        if not isinstance(f, dict):
+            continue
+        rid = str(f.get("RuleID") or "secret")
+        score = _gl_score(rid)
+        worst = max(worst, score)
+        rel = str(f.get("File") or "?")
+        hits.append((score, "%s — %s:%s" % (rid, rel, f.get("StartLine", "?"))))
+    if not hits:
+        return (1, [(1, "no findings")])
+    hits.sort(key=lambda h: -h[0])
+    shown = hits[:6] + ([(1, "+%d more location(s)" % (len(hits) - 6))] if len(hits) > 6 else [])
+    return (worst, shown)
+
+
+def run_gitleaks(spec, t, config=None):
+    gl = shutil.which(spec.get("detect", "gitleaks"))
+    if not gl:
+        return ("skip", "not installed", _install_hint(spec))
+    if t.get("mode") == "write":
+        name = os.path.basename(t.get("file_path") or "") or "file.txt"
+        items, notes = [(name, t.get("content") or "")], []
+    else:
+        items, notes = _secret_file_set(t, config)
+        if items is None:
+            return ("skip", notes[0] if notes else "changeset unknown", "")
+    if not items:
+        return ("ok", 1, [(1, "no findings")])
+    tmpdir = tempfile.mkdtemp()
+    try:
+        for rel, text in items:
+            dest = os.path.normpath(os.path.join(tmpdir, rel))
+            if not dest.startswith(tmpdir + os.sep):
+                continue  # a path escaping the tempdir is not something we copy
+            if not os.path.isdir(os.path.dirname(dest)):
+                os.makedirs(os.path.dirname(dest))
+            with open(dest, "w") as f:
+                f.write(text)
+        proc = subprocess.run([gl, "dir", tmpdir, "-f", "json", "-r", "-",
+                               "--no-banner", "--redact"],
+                              capture_output=True, text=True, timeout=60)
+        if proc.returncode not in (0, 1):  # 1 == leaks found
+            return ("skip", "exited %d" % proc.returncode, "")
+        parsed = parse_gitleaks(proc.stdout.replace(tmpdir + os.sep, ""))
+        if parsed is None:
+            return ("skip", "unparseable output", _install_hint(spec))
+        return ("ok", parsed[0], parsed[1])
+    except subprocess.TimeoutExpired:
+        return ("skip", "timed out", "")
+    except Exception as e:
+        return ("skip", "error: %s" % e, "")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def _fmt(arg, subst):
     for k, v in subst.items():
         arg = arg.replace("{%s}" % k, str(v))
@@ -1127,7 +1224,13 @@ def analyze(action, config=None, registry=None):
                     findings.append((src, s, lbl))
                 ran_any = True
                 continue
-            status = run_guarddog(spec, t) if spec.get("handler") == "guarddog" else run_external(name, spec, t)
+            handler = spec.get("handler")
+            if handler == "guarddog":
+                status = run_guarddog(spec, t)
+            elif handler == "gitleaks":
+                status = run_gitleaks(spec, t, config)
+            else:
+                status = run_external(name, spec, t)
             if status[0] == "ok":
                 for s, lbl in status[2]:
                     findings.append((name, s, lbl))
@@ -1159,7 +1262,7 @@ def render_banner(report):
     overall, surfaces = report["overall"], report["surfaces"]
     lines = ["%s %d/10 %s — riskscan [%s]" % (glyph, overall, word, ", ".join(surfaces))]
     for name, s, lbl in sorted(report["findings"], key=lambda x: -x[1]):
-        if overall > 2 and lbl.startswith("no known-dangerous"):
+        if overall > 2 and lbl.startswith(("no known-dangerous", "no credential pattern", "no findings")):
             continue  # drop "nothing found" filler once a real finding exists
         lines.append("  • [%s] %s [%d/10]" % (name, lbl, s))
     for name, surf, reason, hint in report["skipped"]:

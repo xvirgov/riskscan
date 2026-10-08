@@ -273,6 +273,40 @@ def test_cd_that_needs_execution_is_not_analyzed():
         shutil.rmtree(clean, ignore_errors=True)
 
 
+def test_gitleaks_findings_are_redacted_and_relative():
+    """gitleaks' JSON carries the credential in `Secret`/`Match`, and its `File` is the tempdir
+    path we materialized. Neither may reach a finding: one leaks the secret, the other leaks a
+    path the user cannot act on."""
+    if not shutil.which("gitleaks"):
+        return  # analyzer absent — the ⚪ path is what runs, covered by the fail-loud tests
+    cfg = {"analyzers": {"gitleaks": {"enabled": True}}, "on_missing": "suggest"}
+    pem = ("-----BEGIN OPENSSH PRIVATE KEY-----\n"
+           "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMw\n"
+           "-----END OPENSSH PRIVATE KEY-----\n")
+    r = engine.analyze(engine.make_action("write", file_path="deploy/id_ed25519", content=pem), cfg)
+    assert r["overall"] == 9, r["findings"]
+    blob = engine.render_banner(r) + engine.render_agent_context(r)
+    assert "b3BlbnNzaC1rZXktdjEA" not in blob, "gitleaks secret leaked into the banner"
+    assert "REDACTED" not in blob, "the redaction placeholder should not be rendered either"
+    assert "/var/folders" not in blob and "tmp" not in blob.split("id_ed25519")[0][-40:], \
+        "the tempdir path must be stripped from reported locations"
+
+
+def test_gitleaks_scores_generic_rules_lower():
+    assert engine._gl_score("private-key") == 9
+    assert engine._gl_score("github-pat") == 9
+    assert engine._gl_score("generic-api-key") == engine.GL_GENERIC == 6
+
+
+def test_gitleaks_parser_rejects_secret_bearing_fields():
+    out = engine.parse_gitleaks('[{"RuleID":"aws-access-token","File":"a.env","StartLine":3,'
+                                '"Secret":"AKIAREALLIVEKEY00000","Match":"key=AKIAREALLIVEKEY00000"}]')
+    assert out[0] == 9
+    assert all("AKIAREALLIVEKEY" not in lbl for _, lbl in out[1])
+    assert engine.parse_gitleaks("[]") == (1, [(1, "no findings")])
+    assert engine.parse_gitleaks("not json") is None
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

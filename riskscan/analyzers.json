@@ -32,6 +32,14 @@
     "network": true,
     "install": { "note": "needs Python 3.10+: brew install pipx && pipx install guarddog (or docker pull ghcr.io/datadog/guarddog)" }
   },
+  "gitleaks": {
+    "surfaces": ["secrets"],
+    "detect": "gitleaks",
+    "handler": "gitleaks",
+    "parse": "gitleaks",
+    "network": false,
+    "install": { "brew": "brew install gitleaks", "go": "go install github.com/gitleaks/gitleaks/v8@latest" }
+  },
   "bandit": {
     "surfaces": ["python"],
     "detect": "bandit",

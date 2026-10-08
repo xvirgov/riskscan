@@ -17,6 +17,7 @@
     "sh-guard": { "enabled": false },
     "osv-scanner": { "enabled": true },
     "guarddog": { "enabled": true },
+    "gitleaks": { "enabled": true },
     "bandit": { "enabled": true }
   }
 }

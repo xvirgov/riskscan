@@ -159,6 +159,7 @@ install hint) — adding one is one entry plus its binary.
 | **sh-guard** | bash | AST classifier with pipeline **taint analysis** + MITRE ATT&CK mapping | py3.12 lib — see `analyzers.json` |
 | **osv-scanner** | deps | CVEs from a **pinned lockfile** (unpinned manifests report ⚪) | `brew install osv-scanner` |
 | **guarddog** | deps | malicious-package heuristics (exfil, install-scripts, typosquats) | `pipx install guarddog` |
+| **gitleaks** | secrets | 170+ maintained credential rules over the same changeset, with `.gitleaks.toml` allowlisting | `brew install gitleaks` |
 | **bandit** | python | source SAST for written `.py` files | `pipx install bandit` |
 
 Enable/disable in `riskscan/config.default.json`. `on_missing: suggest` shows the ⚪
@@ -248,6 +249,23 @@ blob's line:
   • [builtin:secrets] private key block (base64-encoded) — sealed-secret.yaml:6 (staged) [9/10]
   • [builtin:secrets] high-entropy value assigned to `password` — values.yaml:2 (staged) [6/10]
 ```
+
+### gitleaks on the same surface
+
+The builtin pack is the zero-dependency floor; **gitleaks** (if installed) scans the identical
+file slice and reports alongside it. They are complements, not substitutes, and a real run shows
+why: the builtin catches `AKIA…` key ids that gitleaks' default config allowlists, while gitleaks
+brings 170+ provider rules the builtin has never heard of.
+
+Two integration details worth knowing:
+
+- **`gitleaks git --staged` does not fit a pre-execution hook.** It reads the index, which is still
+  empty when `git add` is the command *about to run*. (It fits a `pre-commit` hook perfectly — that
+  is what it is for.) riskscan instead materializes the resolved changeset into a tempdir and runs
+  `gitleaks dir`, so the write surface and all four git keys take one code path.
+- **`--redact` is not optional.** gitleaks' JSON carries the credential in `Secret`/`Match`;
+  `--redact` scrubs the report itself, so the value never enters riskscan's process, its log, the
+  banner or the model's context. The tempdir prefix is stripped from reported paths too.
 
 Public key material is deliberately green — `*.pub`, `known_hosts` and `ssh_config` carry no
 secret. A passphrase-protected private key is **not** green: the passphrase is brute-forcible
