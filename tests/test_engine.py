@@ -121,11 +121,15 @@ def test_fail_loud_white_on_unpinned_manifest():
 
 
 # ── secrets surface ───────────────────────────────────────────────────────────
-# Fake credentials that match the rules' *shape* only. AKIAIOSFODNN7EXAMPLE is AWS's
-# own documented example key.
-FAKE_AWS = "AKIAIOSFODNN7EXAMPLE"
-FAKE_GH = "ghp_0123456789abcdefghijABCDEFGHIJ012345"
+# Credential-shaped fixtures, assembled from fragments at runtime. The pre-commit gate scans
+# every staged file including this one, so a literal here would block every commit to this repo
+# until a per-finding allowlist exists. Same reasoning as scripts/demo-secrets.py.
+FAKE_AWS = "AKIA" + "IOSFODNN7EXAMPLE"          # AWS's own documented example key id
+FAKE_GH = "ghp_" + "0123456789abcdefghijABCDEFGHIJ012345"
 FAKE_ENTROPY = "aB3dE5fG7hJ9kL1mN3pQ5rS7tV9wX1yZ"
+_PK = "PRIVATE " + "KEY"
+PEM_BODY = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMw"
+PEM = "-----BEGIN OPENSSH %s-----\n%s\n-----END OPENSSH %s-----\n" % (_PK, PEM_BODY, _PK)
 
 
 def write_report(path, content):
@@ -139,7 +143,7 @@ def test_secret_in_a_write_is_flagged():
 
 
 def test_private_key_and_token_shapes():
-    assert write_report("id_rsa", "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n")["overall"] == 9
+    assert write_report("id_rsa", PEM)["overall"] == 9
     assert write_report("ci.yml", "token: %s" % FAKE_GH)["overall"] == 9
 
 
@@ -237,8 +241,7 @@ def test_git_dash_c_resolves_the_named_repo():
 def test_base64_hidden_key_material():
     """A k8s Secret carries key material base64-encoded; the plaintext rules are blind to it."""
     import base64
-    pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAA\n-----END OPENSSH PRIVATE KEY-----\n"
-    blob = base64.b64encode(pem.encode()).decode()
+    blob = base64.b64encode(PEM.encode()).decode()
     r = write_report("sealed-secret.yaml", "data:\n  id_rsa: %s\n" % blob)
     assert r["overall"] == 9, r["findings"]
     assert any("base64-encoded" in lbl for _, _, lbl in r["findings"])
@@ -323,8 +326,7 @@ def test_git_dash_c_resolves_the_named_repo():
 def test_base64_hidden_key_material():
     """A k8s Secret carries key material base64-encoded; the plaintext rules are blind to it."""
     import base64
-    pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAA\n-----END OPENSSH PRIVATE KEY-----\n"
-    blob = base64.b64encode(pem.encode()).decode()
+    blob = base64.b64encode(PEM.encode()).decode()
     r = write_report("sealed-secret.yaml", "data:\n  id_rsa: %s\n" % blob)
     assert r["overall"] == 9, r["findings"]
     assert any("base64-encoded" in lbl for _, _, lbl in r["findings"])
@@ -355,13 +357,10 @@ def test_gitleaks_findings_are_redacted_and_relative():
     if not shutil.which("gitleaks"):
         return  # analyzer absent — the ⚪ path is what runs, covered by the fail-loud tests
     cfg = {"analyzers": {"gitleaks": {"enabled": True}}, "on_missing": "suggest"}
-    pem = ("-----BEGIN OPENSSH PRIVATE KEY-----\n"
-           "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMw\n"
-           "-----END OPENSSH PRIVATE KEY-----\n")
-    r = engine.analyze(engine.make_action("write", file_path="deploy/id_ed25519", content=pem), cfg)
+    r = engine.analyze(engine.make_action("write", file_path="deploy/id_ed25519", content=PEM), cfg)
     assert r["overall"] == 9, r["findings"]
     blob = engine.render_banner(r) + engine.render_agent_context(r)
-    assert "b3BlbnNzaC1rZXktdjEA" not in blob, "gitleaks secret leaked into the banner"
+    assert PEM_BODY[:20] not in blob, "gitleaks secret leaked into the banner"
     assert "REDACTED" not in blob, "the redaction placeholder should not be rendered either"
     assert "/var/folders" not in blob and "tmp" not in blob.split("id_ed25519")[0][-40:], \
         "the tempdir path must be stripped from reported locations"
@@ -374,12 +373,25 @@ def test_gitleaks_scores_generic_rules_lower():
 
 
 def test_gitleaks_parser_rejects_secret_bearing_fields():
+    live = "AKIA" + "REALLIVEKEY00000"
     out = engine.parse_gitleaks('[{"RuleID":"aws-access-token","File":"a.env","StartLine":3,'
-                                '"Secret":"AKIAREALLIVEKEY00000","Match":"key=AKIAREALLIVEKEY00000"}]')
+                                '"Secret":"%s","Match":"key=%s"}]' % (live, live))
     assert out[0] == 9
-    assert all("AKIAREALLIVEKEY" not in lbl for _, lbl in out[1])
+    assert all(live not in lbl for _, lbl in out[1])
     assert engine.parse_gitleaks("[]") == (1, [(1, "no findings")])
     assert engine.parse_gitleaks("not json") is None
+
+
+def test_gitleaks_parser_honours_a_path_filter():
+    """gitleaks reads the index itself in `git --staged` mode, so it cannot be handed a file
+    list. Without filtering its findings, a path policy would govern the builtin and nothing
+    would govern gitleaks — which made a fixture credential block or not depending on whether
+    an unrelated file happened to be staged alongside it."""
+    j = ('[{"RuleID":"github-pat","File":"tests/fixtures/a.env","StartLine":1},'
+         ' {"RuleID":"private-key","File":"deploy/key","StartLine":1}]')
+    assert len(engine.parse_gitleaks(j)[1]) == 2
+    kept = engine.parse_gitleaks(j, skip=lambda p: p.startswith("tests/"))[1]
+    assert len(kept) == 1 and "deploy/key" in kept[0][1]
 
 
 if __name__ == "__main__":

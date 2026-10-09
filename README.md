@@ -282,7 +282,7 @@ facts. So the two layers divide by what they can know, not by what they scan:
 | Layer | Sees | Catches uniquely | Verdict |
 |---|---|---|---|
 | PreToolUse (`claude_code.py`) | proposed *content*, before the file exists | secrets that never reach git; warns before the agent acts | advisory |
-| `pre-commit` (`git_hook.py --staged`) | the actual index, via `git show :<path>` | non-Write arrivals (`cp ~/.aws/credentials .`), **partial stages** (`git add -p`), your own manual commits | **blocks** |
+| `pre-commit` (`git_hook.py --staged`) | the actual index, via `git show :<path>` | non-Write arrivals (`cp ~/.aws/credentials .`), **partial stages** (`git add -p`), staged **binaries** (keystores), your own manual commits | **blocks** |
 | `pre-push` (`git_hook.py --pre-push`) | the pushed range, from git's stdin | a secret committed and later removed — still in the history being pushed | **blocks** |
 
 ```bash
@@ -321,6 +321,17 @@ Consequences of that split, by design:
 - **A directory change is no longer predicted.** `cd`, `pushd`, a subshell, `env -C` or a variable
   target means the agent layer does not resolve the tree at all. With the hooks installed it says
   nothing (the handoff is covered); without them it reads ⚪ with an install hint.
+- **The gate scans everything staged.** `secrets.skip_paths` keeps a *changeset preview* quiet in
+  the agent layer, where fixture trees are mostly noise; it is the wrong policy for the gate,
+  because `tests/fixtures/` is exactly where a credential gets parked "temporarily" and then
+  committed. Opt back in per repo with `secrets.hook_skip_paths`. Whichever list is in effect
+  governs **both** analyzers — gitleaks reads the index itself in `--staged` mode, so its findings
+  are filtered by path after parsing rather than by handing it a file list.
+- **Staged binaries are extracted and scanned separately.** `git diff` emits only
+  `Binary files ... differ`, so a staged keystore is invisible to both analyzers: the builtin
+  cannot decode it and gitleaks in diff mode gets no content. The blobs are written out under
+  their real basenames (gitleaks has filename-driven rules like `pkcs12-file`) and scanned with
+  `gitleaks dir`. Without gitleaks installed they report ⚪ instead.
 - Over a *range*, the builtin's line numbers are approximate — several commits' added lines are
   synthesized into one view. gitleaks' per-commit numbers are exact; both are reported.
 

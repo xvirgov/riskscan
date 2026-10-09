@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from riskscan import engine  # noqa: E402
@@ -44,26 +45,55 @@ def _block_threshold():
     return int(cfg.get("block_threshold", 9))
 
 
+def _git_bytes(args):
+    """Raw bytes from git — `_git` decodes as text, which corrupts a binary blob."""
+    try:
+        p = subprocess.run(["git"] + args, capture_output=True, timeout=30)
+    except Exception:
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+def _hook_skips():
+    """Paths this layer declines to scan — empty by default, i.e. everything staged is scanned.
+
+    `secrets.skip_paths` exists to keep a *changeset preview* quiet in the agent layer, where
+    fixture trees are mostly noise. It is the wrong policy for the gate: `tests/fixtures/` is
+    exactly where a credential gets parked "temporarily" and then committed. Opt back in with
+    `secrets.hook_skip_paths` if a repo makes that unworkable.
+    """
+    return (engine.CONFIG.get("secrets") or {}).get("hook_skip_paths", [])
+
+
+def _skipper():
+    skips = _hook_skips()
+    return (lambda path: engine._secret_skip(path, skips)) if skips else None
+
+
 # ── gathering what is actually being committed / pushed ──────────────────────
 def staged_items():
-    """(relpath, staged content) for each file in the index.
+    """(all staged paths, readable (relpath, content) pairs, unreadable paths).
+
+    The three are separate on purpose. "Nothing staged" and "nothing the builtin can read" are
+    different states, and conflating them used to skip gitleaks entirely whenever the builtin's
+    list came back empty.
 
     Read with `git show :<path>`, i.e. the blob in the index — NOT the working-tree file. After
     `git add -p` those differ, and it is the staged version that becomes the commit.
     """
     out = _git(["diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR"])
-    if not out:
-        return []
-    items = []
-    for rel in [r for r in out.split("\0") if r.strip()]:
-        if engine._secret_skip(rel, (engine.CONFIG.get("secrets") or {}).get(
-                "skip_paths", engine.SECRET_SKIP_PATHS)):
+    names = [r for r in (out or "").split("\0") if r.strip()]
+    skips = _hook_skips()
+    items, unreadable = [], []
+    for rel in names:
+        if skips and engine._secret_skip(rel, skips):
             continue
         blob = _git(["show", ":" + rel])
         if blob is None or "\0" in blob[:8000]:
+            unreadable.append(rel)      # binary: gitleaks still scans it, the builtin cannot
             continue
         items.append((rel, blob))
-    return items
+    return names, items, unreadable
 
 
 _DIFF_FILE = re.compile(r"^\+\+\+ b/(.*)$")
@@ -98,9 +128,9 @@ def range_items(rev_args):
             per.setdefault(cur, []).append((line_no, ln[1:]))
             line_no += 1
     items = []
-    skips = (engine.CONFIG.get("secrets") or {}).get("skip_paths", engine.SECRET_SKIP_PATHS)
+    skips = _hook_skips()
     for rel, rows in per.items():
-        if engine._secret_skip(rel, skips):
+        if skips and engine._secret_skip(rel, skips):
             continue
         # pad to the real line numbers so a reported location matches the file
         text, at = [], 1
@@ -115,7 +145,7 @@ def range_items(rev_args):
 
 
 # ── scanning ─────────────────────────────────────────────────────────────────
-def scan(items, label, gitleaks_argv=None):
+def scan(items, label, gitleaks_argv=None, unreadable=()):
     """Run the same analyzers the agent layer uses, and return an engine-shaped report."""
     findings, skipped = [], []
     for rel, text in items:
@@ -128,7 +158,7 @@ def scan(items, label, gitleaks_argv=None):
         try:
             proc = subprocess.run([gl] + gitleaks_argv, capture_output=True, text=True, timeout=120)
             if proc.returncode in (0, 1):
-                parsed = engine.parse_gitleaks(proc.stdout)
+                parsed = engine.parse_gitleaks(proc.stdout, skip=_skipper())
                 if parsed:
                     for s, lbl in parsed[1]:
                         if not lbl.startswith("no findings"):
@@ -139,12 +169,62 @@ def scan(items, label, gitleaks_argv=None):
             skipped.append(("gitleaks", "secrets", "error: %s" % e, ""))
     elif not gl:
         skipped.append(("gitleaks", "secrets", "not installed", "brew install gitleaks"))
+    if unreadable:
+        # `git diff` emits only "Binary files ... differ", so a staged keystore is invisible to
+        # BOTH analyzers: the builtin cannot decode it and gitleaks (diff mode) gets no content.
+        # `gitleaks dir` over the extracted blobs does see it — that is the only way in.
+        found, why = _scan_binaries(unreadable, gl)
+        findings += found
+        if why:
+            skipped.append(("gitleaks", "secrets", "%d binary file(s) not scanned (%s): %s"
+                            % (len(unreadable), why, ", ".join(unreadable[:3])), ""))
 
     scores = [s for _, s, _ in findings]
     overall = max(scores) if scores else 0
     state = engine.state_of(overall) if findings else engine.NOT_ANALYZED
     return {"surfaces": ["secrets"], "findings": findings, "skipped": skipped,
             "overall": overall, "state": state}
+
+
+def _scan_binaries(paths, gl):
+    """(findings, reason-it-could-not-run) for staged binary blobs, via `gitleaks dir`.
+
+    The blobs are written under their real basenames: gitleaks has filename-driven rules
+    (pkcs12-file, and the like) that would not fire against a generated temp name.
+    """
+    if not gl:
+        return [], "gitleaks not installed"
+    tmpdir = tempfile.mkdtemp()
+    try:
+        wrote = 0
+        for rel in paths[:20]:
+            blob = _git_bytes(["show", ":" + rel])
+            if blob is None:
+                continue
+            dest = os.path.normpath(os.path.join(tmpdir, rel))
+            if not dest.startswith(tmpdir + os.sep):
+                continue
+            if not os.path.isdir(os.path.dirname(dest)):
+                os.makedirs(os.path.dirname(dest))
+            with open(dest, "wb") as f:
+                f.write(blob)
+            wrote += 1
+        if not wrote:
+            return [], "could not extract the blobs"
+        proc = subprocess.run([gl, "dir", tmpdir, "-f", "json", "-r", "-",
+                               "--no-banner", "--redact"],
+                              capture_output=True, text=True, timeout=120)
+        if proc.returncode not in (0, 1):
+            return [], "gitleaks exited %d" % proc.returncode
+        parsed = engine.parse_gitleaks(proc.stdout.replace(tmpdir + os.sep, ""), skip=_skipper())
+        if not parsed:
+            return [], "unparseable output"
+        return [("gitleaks", sc, lbl) for sc, lbl in parsed[1]
+                if not lbl.startswith("no findings")], None
+    except Exception as e:
+        return [], "error: %s" % e
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def report_and_exit(report, what):
@@ -165,11 +245,12 @@ def report_and_exit(report, what):
 
 
 def run_staged():
-    items = staged_items()
-    if not items:
-        return 0
-    return report_and_exit(scan(items, "staged", ["git", "--staged", "-f", "json", "-r", "-",
-                                                 "--no-banner", "--redact"]), "commit")
+    names, items, unreadable = staged_items()
+    if not names:
+        return 0  # nothing staged; a commit here is a no-op or a merge
+    return report_and_exit(scan(items, "staged",
+                                ["git", "--staged", "-f", "json", "-r", "-",
+                                 "--no-banner", "--redact"], unreadable), "commit")
 
 
 def run_pre_push():

@@ -1093,9 +1093,14 @@ def _gl_score(rule_id):
     return 9  # a named provider rule is a specific credential shape, like the builtin's tier-1
 
 
-def parse_gitleaks(out):
+def parse_gitleaks(out, skip=None):
     """gitleaks JSON report → (score, findings). Reads RuleID/File/StartLine only: `Secret` and
-    `Match` carry the credential itself and must never reach a finding."""
+    `Match` carry the credential itself and must never reach a finding.
+
+    `skip(path)` drops findings by path. gitleaks reads the index itself in `git --staged` mode,
+    so it cannot be handed a file list — without filtering here, one path policy would govern
+    the builtin and nothing would govern gitleaks.
+    """
     try:
         d = json.loads(out or "[]")
     except Exception:
@@ -1107,6 +1112,8 @@ def parse_gitleaks(out):
     hits, worst = [], 0
     for f in d:
         if not isinstance(f, dict):
+            continue
+        if skip and skip(str(f.get("File") or "")):
             continue
         rid = str(f.get("RuleID") or "secret")
         score = _gl_score(rid)
