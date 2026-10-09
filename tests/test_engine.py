@@ -394,6 +394,75 @@ def test_gitleaks_parser_honours_a_path_filter():
     assert len(kept) == 1 and "deploy/key" in kept[0][1]
 
 
+# ── allowlist ─────────────────────────────────────────────────────────────────
+def test_allowlist_three_granularities():
+    """A line-pinned entry rots when the file shifts, so file-wide and rule-wide forms exist."""
+    text = "k=%s\n" % FAKE_AWS
+    for entry in ("deploy/.env:aws-access-key-id:1",   # this finding
+                  "deploy/.env:aws-access-key-id",     # that rule in that file
+                  "aws-access-key-id"):                # that rule everywhere
+        sc, fs = engine._secret_scan(text, "deploy/.env", {entry: "known example"})
+        assert fs == [], (entry, fs)
+    # a near-miss must NOT suppress
+    for entry in ("other/.env:aws-access-key-id:1", "deploy/.env:aws-access-key-id:9",
+                  "deploy/.env:github-token"):
+        sc, fs = engine._secret_scan(text, "deploy/.env", {entry: ""})
+        assert sc == 9, (entry, fs)
+
+
+def test_suppressed_findings_stay_visible():
+    """An allowlist that silently drops findings IS the false green this surface exists to
+    prevent. You may ignore a finding; you may not make riskscan pretend it never saw one."""
+    supp = []
+    engine._secret_scan("k=%s\n" % FAKE_AWS, "deploy/.env",
+                        {"aws-access-key-id": "documented example"}, supp)
+    assert supp == [("deploy/.env:aws-access-key-id:1", "documented example")]
+    notes = engine._suppression_notes(supp)
+    assert len(notes) == 1
+    assert "1 finding(s) suppressed" in notes[0] and "documented example" in notes[0]
+    assert engine._suppression_notes([]) == []
+
+
+def test_allowlist_keeps_the_other_findings():
+    text = "k=%s\ntok=%s\n" % (FAKE_AWS, FAKE_GH)
+    sc, fs = engine._secret_scan(text, "x.env", {"aws-access-key-id": "ok"})
+    assert sc == 9 and len(fs) == 1 and "GitHub token" in fs[0][1]
+
+
+def test_allowlist_file_is_read_from_an_ancestor_with_its_reason():
+    d = tempfile.mkdtemp(prefix="riskscan-ign-")
+    try:
+        os.makedirs(os.path.join(d, "a", "b"))
+        with open(os.path.join(d, ".riskscanignore"), "w") as f:
+            f.write("# a comment line\n\nx.env:aws-access-key-id  # vendor sample\n")
+        engine._IGNORES_CACHE.clear()
+        ig = engine.load_ignores(os.path.join(d, "a", "b"))
+        assert ig == {"x.env:aws-access-key-id": "vendor sample"}, ig
+    finally:
+        engine._IGNORES_CACHE.clear()
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_gitleaks_findings_are_allowlisted_too():
+    j = '[{"RuleID":"generic-api-key","File":"docs/x.md","StartLine":7}]'
+    supp = []
+    out = engine.parse_gitleaks(j, ignores={"docs/x.md:generic-api-key:7": "doc sample"},
+                                suppressed=supp)
+    assert out == (1, [(1, "no findings")]), out
+    assert supp == [("docs/x.md:generic-api-key:7", "doc sample")]
+
+
+def test_skip_paths_are_no_longer_silent():
+    """Same defect as a silent allowlist: a skipped path produced no output at all, so a real
+    credential in a fixture tree was invisible rather than excused."""
+    d = _git_repo("token: %s\n" % FAKE_GH, filename="tests/fixtures/s.yaml")
+    try:
+        r = report("git add -A", cwd=d)
+        assert any("skip_paths" in reason for _, _, reason, _ in r["skipped"]), r["skipped"]
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

@@ -1,0 +1,17 @@
+# Copy to .riskscanignore at your repo root. Entries are matched most-specific-first:
+#
+#   <file>:<rule>:<line>    this one finding
+#   <file>:<rule>           that rule anywhere in that file
+#   <rule>                  that rule everywhere
+#
+# The trailing comment is the reason. It is shown every time the finding is suppressed, because
+# a suppressed finding is still reported as a counted white line — never silently dropped.
+#
+# Rule ids are slugs of the rule label (`AWS access key id` -> `aws-access-key-id`) for the
+# builtin pack, and gitleaks' own RuleIDs for gitleaks findings. When a finding blocks a commit
+# the hook prints the exact entry to paste.
+#
+# A personal, uncommitted allowlist can live at ~/.riskscan/ignore instead.
+
+docs/cookbook.md:aws-access-key-id:42   # AWS's documented example key, in a doc
+terraform/examples:generic-api-key      # vendor sample values

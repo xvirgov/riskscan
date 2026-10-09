@@ -346,6 +346,60 @@ Consequences of that split, by design:
   admitting ignorance.
 - For `Edit`/`MultiEdit` the line number is relative to the edited fragment, not the file.
 
+## Allowlisting a false positive
+
+A finding you have decided about goes in `.riskscanignore` at the repo root — committed, so the
+decision is reviewable in a diff rather than living in someone's shell history.
+
+```
+# <file>:<rule>:<line>   this one finding
+# <file>:<rule>          that rule anywhere in that file
+# <rule>                 that rule everywhere
+docs/cookbook.md:aws-access-key-id:42   # AWS's documented example key, in a doc
+terraform/examples:generic-api-key      # vendor sample values
+```
+
+Most specific key wins. The trailing comment is the reason. A personal, uncommitted allowlist can
+live at `~/.riskscan/ignore` instead. See `.riskscanignore.example`.
+
+**A suppressed finding stays visible**, as a counted ⚪ carrying the reason:
+
+```
+⚪ [gitleaks] 1 finding(s) suppressed by .riskscanignore:
+   tests/test_engine.py:generic-api-key:168 (fixture constant, not a credential)
+```
+
+That is the whole point. An allowlist that silently drops findings *is* the false green this tool
+exists to prevent — you may decide to ignore something, you may not make riskscan pretend it never
+saw it. `skip_paths` reports a count for the same reason.
+
+When the gate blocks, it prints the entry to paste:
+
+```
+riskscan: blocked — a credential of unambiguous shape is in what you are about to commit.
+  If a finding is a false positive, add it to .riskscanignore:
+    docs/cookbook.md:aws-access-key-id:3   # why
+```
+
+Rule ids are slugs of the builtin's rule labels (`AWS access key id` → `aws-access-key-id`) and
+gitleaks' own `RuleID`s. Renaming a builtin rule's label changes its id and invalidates entries
+that used it — the ids are derived rather than stored because the rule tuple is
+`custom_rules.json`'s public format.
+
+## Turning down a noisy analyzer
+
+`max_score` caps what one analyzer may contribute:
+
+```json
+"analyzers": { "sh-guard": { "enabled": true, "max_score": 6 } }
+```
+
+A taint classifier that calls every heredoc a 10 is still worth reading; it is not worth letting
+it set the overall verdict. Capping keeps the finding and removes its authority — at 6 it can
+never cross `ask_threshold` on its own, so it informs without interrupting. The cost is real: a
+capped analyzer also stops escalating the cases it is uniquely good at, so prefer a builtin rule
+for anything you want to keep deciding.
+
 ## Custom rules
 
 Add or override built-in rules without touching code: copy

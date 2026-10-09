@@ -5,6 +5,7 @@
   "ask_threshold": 7,
   "secrets": {
     "max_files": 40,
+    "block_threshold": 9,
     "skip_paths": [
       "(^|/)\\.git/",
       "(^|/)(tests?|testdata|fixtures?|__snapshots__|vendor|node_modules|\\.venv|venv|dist|build)/",
@@ -14,7 +15,7 @@
   },
   "analyzers": {
     "builtin": { "enabled": true },
-    "sh-guard": { "enabled": false },
+    "sh-guard": { "enabled": false, "max_score": 6 },
     "osv-scanner": { "enabled": true },
     "guarddog": { "enabled": true },
     "gitleaks": { "enabled": true },

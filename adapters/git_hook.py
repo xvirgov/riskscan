@@ -148,8 +148,10 @@ def range_items(rev_args):
 def scan(items, label, gitleaks_argv=None, unreadable=()):
     """Run the same analyzers the agent layer uses, and return an engine-shaped report."""
     findings, skipped = [], []
+    ignores = engine.load_ignores(os.getcwd())   # git runs hooks from the worktree root
+    supp, fps = [], {}
     for rel, text in items:
-        sc, fs = engine._secret_scan(text, rel)
+        sc, fs = engine._secret_scan(text, rel, ignores, supp, fps)
         for s, lbl in fs:
             findings.append(("builtin:secrets", s, "%s (%s)" % (lbl, label)))
 
@@ -158,7 +160,8 @@ def scan(items, label, gitleaks_argv=None, unreadable=()):
         try:
             proc = subprocess.run([gl] + gitleaks_argv, capture_output=True, text=True, timeout=120)
             if proc.returncode in (0, 1):
-                parsed = engine.parse_gitleaks(proc.stdout, skip=_skipper())
+                parsed = engine.parse_gitleaks(proc.stdout, skip=_skipper(),
+                                               ignores=ignores, suppressed=supp, fps=fps)
                 if parsed:
                     for s, lbl in parsed[1]:
                         if not lbl.startswith("no findings"):
@@ -173,20 +176,22 @@ def scan(items, label, gitleaks_argv=None, unreadable=()):
         # `git diff` emits only "Binary files ... differ", so a staged keystore is invisible to
         # BOTH analyzers: the builtin cannot decode it and gitleaks (diff mode) gets no content.
         # `gitleaks dir` over the extracted blobs does see it — that is the only way in.
-        found, why = _scan_binaries(unreadable, gl)
+        found, why = _scan_binaries(unreadable, gl, ignores, supp, fps)
         findings += found
         if why:
             skipped.append(("gitleaks", "secrets", "%d binary file(s) not scanned (%s): %s"
                             % (len(unreadable), why, ", ".join(unreadable[:3])), ""))
 
+    skipped += [("builtin:secrets", "secrets", n, "")
+                for n in engine._suppression_notes(supp)]
     scores = [s for _, s, _ in findings]
     overall = max(scores) if scores else 0
     state = engine.state_of(overall) if findings else engine.NOT_ANALYZED
     return {"surfaces": ["secrets"], "findings": findings, "skipped": skipped,
-            "overall": overall, "state": state}
+            "overall": overall, "state": state, "fingerprints": fps}
 
 
-def _scan_binaries(paths, gl):
+def _scan_binaries(paths, gl, ignores=None, supp=None, fps=None):
     """(findings, reason-it-could-not-run) for staged binary blobs, via `gitleaks dir`.
 
     The blobs are written under their real basenames: gitleaks has filename-driven rules
@@ -216,7 +221,8 @@ def _scan_binaries(paths, gl):
                               capture_output=True, text=True, timeout=120)
         if proc.returncode not in (0, 1):
             return [], "gitleaks exited %d" % proc.returncode
-        parsed = engine.parse_gitleaks(proc.stdout.replace(tmpdir + os.sep, ""), skip=_skipper())
+        parsed = engine.parse_gitleaks(proc.stdout.replace(tmpdir + os.sep, ""),
+                                       skip=_skipper(), ignores=ignores, suppressed=supp, fps=fps)
         if not parsed:
             return [], "unparseable output"
         return [("gitleaks", sc, lbl) for sc, lbl in parsed[1]
@@ -238,8 +244,22 @@ def report_and_exit(report, what):
     if report["overall"] >= _block_threshold():
         sys.stderr.write(
             "\nriskscan: blocked — a credential of unambiguous shape is in what you are about to "
-            "%s.\n  Remove it, or bypass with --no-verify / RISKSCAN_SKIP=1 if this is a false "
-            "positive.\n" % what)
+            "%s.\n  Remove it, or bypass once with --no-verify / RISKSCAN_SKIP=1.\n" % what)
+        # Paste-ready, because making someone assemble a fingerprint by hand is how an allowlist
+        # ends up unused and the bypass becomes the habit.
+        fps = report.get("fingerprints") or {}
+        blocking = []
+        for _, sc, lbl in report["findings"]:
+            if sc < _block_threshold():
+                continue
+            # the builtin's labels gain a " (staged)" / " (push)" suffix on the way into a report
+            fp = fps.get(lbl) or fps.get(lbl.rsplit(" (", 1)[0])
+            if fp:
+                blocking.append(fp)
+        if blocking:
+            sys.stderr.write("\n  If a finding is a false positive, add it to .riskscanignore:\n")
+            for fp in dict.fromkeys(blocking):
+                sys.stderr.write("    %s   # why\n" % fp)
         return 1
     return 0
 

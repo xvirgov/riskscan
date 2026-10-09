@@ -1,0 +1,7 @@
+# riskscan's own allowlist. Format: <file>:<rule>:<line> | <file>:<rule> | <rule>
+# A trailing comment is the reason, and it is printed whenever the finding is suppressed.
+# `python3 adapters/git_hook.py --staged` prints paste-ready entries when it blocks.
+
+# The test fixtures are credential-SHAPED by necessity; they are assembled from fragments at
+# runtime so no literal is stored, but gitleaks' entropy rule still reads one of the constants.
+tests/test_engine.py:generic-api-key   # fixture constant, not a credential

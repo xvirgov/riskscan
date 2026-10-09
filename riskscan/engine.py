@@ -209,7 +209,8 @@ def targets_from_action(action):
         if content:
             # Any file can carry a credential, so this is not limited by extension — and it
             # catches the secret one step earlier than the git surface does.
-            targets.append({"surface": "secrets", "mode": "write", "file_path": fp, "content": content})
+            targets.append({"surface": "secrets", "mode": "write", "file_path": fp,
+                            "content": content, "cwd": action.get("cwd")})
         if base in MANIFESTS:
             targets.append({"surface": "deps", "ecosystem": MANIFESTS[base], "packages": [], "manifest": fp, "content": content, "persisted": True})
         lang = LANG_BY_EXT.get(ext)
@@ -611,23 +612,102 @@ def _b64_spans(text, limit=8):
     return out
 
 
-def _secret_scan(text, where=""):
+IGNORE_BASENAME = ".riskscanignore"
+GLOBAL_IGNORE = os.path.expanduser("~/.riskscan/ignore")
+ASSIGN_RULE_ID = "high-entropy-assignment"
+_IGNORES_CACHE = {}
+
+
+def _rule_id(label):
+    """Stable slug for a rule, used in ignore fingerprints.
+
+    Derived from the label rather than stored in the rule tuple, because the tuple shape is
+    `custom_rules.json`'s public format. The cost: renaming a rule's label changes its id and
+    invalidates existing ignore entries. Documented in the README.
+    """
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", label.lower())).strip("-")[:60]
+
+
+def _find_up(start, name, levels=8):
+    d = os.path.abspath(start or ".")
+    for _ in range(levels):
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            return p
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+def load_ignores(cwd=None):
+    """{key: reason} from `.riskscanignore` (nearest ancestor) plus `~/.riskscan/ignore`.
+
+    Three key forms, because a line-pinned entry rots the moment the file shifts:
+        file:rule:line   this finding
+        file:rule        that rule anywhere in that file
+        rule             that rule everywhere
+    A trailing `# comment` becomes the reason, which is shown when the finding is suppressed —
+    an allowlist whose entries carry no reason is a list of things nobody remembers deciding.
+    """
+    key = os.path.abspath(cwd or os.getcwd())
+    if key in _IGNORES_CACHE:
+        return _IGNORES_CACHE[key]
+    out = {}
+    for path in (GLOBAL_IGNORE, _find_up(key, IGNORE_BASENAME)):
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            with open(path) as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    entry, _, reason = line.partition("#")
+                    entry = entry.strip()
+                    if entry:
+                        out[entry] = reason.strip()
+        except Exception:
+            continue
+    _IGNORES_CACHE[key] = out
+    return out
+
+
+def _ignored(ignores, path, rule, line):
+    """The reason this finding is allowlisted, or None. Most specific key wins."""
+    if not ignores:
+        return None
+    for k in ("%s:%s:%s" % (path, rule, line), "%s:%s" % (path, rule), rule):
+        if k in ignores:
+            return ignores[k] or "(no reason given)"
+    return None
+
+
+def _secret_scan(text, where="", ignores=None, suppressed=None, fps=None):
     """(score, findings) for one blob. Location-only reporting — see SECRET_RULES."""
     if not text:
         return (0, [])
     hits = {}  # label -> (score, first line, count)
 
-    def note(label, score, start):
+    def note(label, score, start, rid=None):
         line = text.count("\n", 0, start) + 1
+        rid = rid or _rule_id(label)
+        reason = _ignored(ignores, where, rid, line)
+        if reason is not None:
+            if suppressed is not None:
+                suppressed.append(("%s:%s:%d" % (where or "?", rid, line), reason))
+            return
         prev = hits.get(label)
-        hits[label] = (score, prev[1] if prev else line, (prev[2] if prev else 0) + 1)
+        hits[label] = (score, prev[1] if prev else line, (prev[2] if prev else 0) + 1, rid)
 
     for pat, score, label in SECRET_RULES:
         for m in re.finditer(pat, text):
             note(label, score, m.start())
     for m in SECRET_ASSIGN.finditer(text):
         if _looks_random(m.group(2) or m.group(3) or ""):
-            note("high-entropy value assigned to `%s`" % m.group(1).lower()[:40], 6, m.start())
+            note("high-entropy value assigned to `%s`" % m.group(1).lower()[:40], 6, m.start(),
+                 ASSIGN_RULE_ID)
     # Same rules over anything base64 hid from them, reported at the encoded blob's line.
     for start, dec in _b64_spans(text):
         for pat, score, label in SECRET_RULES:
@@ -636,11 +716,15 @@ def _secret_scan(text, where=""):
         for m in SECRET_ASSIGN.finditer(dec):
             if _looks_random(m.group(2) or m.group(3) or ""):
                 note("high-entropy value assigned to `%s` (base64-encoded)"
-                     % m.group(1).lower()[:40], 6, start)
+                     % m.group(1).lower()[:40], 6, start, ASSIGN_RULE_ID)
     findings = []
-    for label, (score, line, count) in hits.items():
+    for label, (score, line, count, rid) in hits.items():
         loc = "%s:%d" % (where, line) if where else "line %d" % line
-        findings.append((score, "%s — %s%s" % (label, loc, " (+%d more)" % (count - 1) if count > 1 else "")))
+        text_label = "%s — %s%s" % (label, loc, " (+%d more)" % (count - 1) if count > 1 else "")
+        findings.append((score, text_label))
+        if fps is not None:
+            # keyed by the rendered label, which is what a report's findings carry
+            fps[text_label] = "%s:%s:%d" % (where or "?", rid, line)
     findings.sort(key=lambda f: -f[0])
     return (max((f[0] for f in findings), default=0), findings)
 
@@ -666,6 +750,32 @@ def _read_text(path):
     return raw.decode("utf-8", "replace")
 
 
+def _suppression_notes(suppressed, limit=3):
+    """A suppressed finding stays visible as a counted ⚪. An allowlist that silently drops
+    findings IS the false green this whole surface exists to prevent — you may decide to ignore
+    something, you may not make riskscan pretend it never saw it."""
+    if not suppressed:
+        return []
+    shown = ", ".join("%s (%s)" % (fp, why) for fp, why in suppressed[:limit])
+    more = " +%d more" % (len(suppressed) - limit) if len(suppressed) > limit else ""
+    return ["%d finding(s) suppressed by .riskscanignore: %s%s" % (len(suppressed), shown, more)]
+
+
+def _rel_for(path, cwd):
+    """A repo-relative path, so an ignore entry written for a write looks like one written for
+    a commit. The hook payload hands us absolute paths; fingerprints must not depend on them."""
+    if not path:
+        return ""
+    if cwd:
+        try:
+            r = os.path.relpath(path, cwd)
+            if not r.startswith(".."):
+                return r
+        except Exception:
+            pass
+    return path if not os.path.isabs(path) else os.path.basename(path)
+
+
 def builtin_secrets(t, config=None):
     """Scan content about to be written, or committed/pushed, for credential material.
 
@@ -673,9 +783,14 @@ def builtin_secrets(t, config=None):
     determined at all, so the caller surfaces ⚪ NOT ANALYZED rather than a green;
     `notes` are partial-coverage reasons shown even alongside real findings.
     """
+    ignores = load_ignores(t.get("cwd"))
+    supp = []
     if t.get("mode") == "write":
-        sc, fs = _secret_scan(t.get("content") or "", os.path.basename(t.get("file_path") or ""))
-        return (sc, fs, []) if fs else (1, [(1, "no credential pattern in the written content")], [])
+        sc, fs = _secret_scan(t.get("content") or "", _rel_for(t.get("file_path"), t.get("cwd")),
+                              ignores, supp)
+        notes = _suppression_notes(supp)
+        return (sc, fs, notes) if fs else (
+            1, [(1, "no credential pattern in the written content")], notes)
 
     items, notes = _secret_file_set(t, config)
     if items is None:
@@ -683,10 +798,11 @@ def builtin_secrets(t, config=None):
     where = GIT_SECRET_LABEL.get(t.get("key"), "git")
     hits, worst = [], 0
     for rel, text in items:
-        sc, fs = _secret_scan(text, rel)
+        sc, fs = _secret_scan(text, rel, ignores, supp)
         if fs:
             worst = max(worst, sc)
             hits += fs
+    notes += _suppression_notes(supp)
     if not hits:
         return (1, [(1, "no credential pattern in %d file(s) to %s" % (len(items), where))], notes)
     shown = hits[:6] + ([(1, "+%d more location(s)" % (len(hits) - 6))] if len(hits) > 6 else [])
@@ -705,9 +821,10 @@ def _secret_file_set(t, config=None):
     skips = cfg.get("skip_paths", SECRET_SKIP_PATHS)
     cap = int(cfg.get("max_files", SECRET_MAX_FILES))
     cwd = t.get("cwd") or ""
-    items, notes, unreadable, missing = [], [], [], []
+    items, notes, unreadable, missing, path_skipped = [], [], [], [], []
     for i, rel in enumerate(files):
         if _secret_skip(rel, skips):
+            path_skipped.append(rel)
             continue
         if len(items) >= cap:
             notes.append("%d of %d file(s) past the %d-file scan cap — not scanned"
@@ -725,6 +842,9 @@ def _secret_file_set(t, config=None):
     if unreadable:
         notes.append("%d file(s) unreadable as text (binary or >%dKB): %s"
                      % (len(unreadable), SECRET_MAX_BYTES // 1024, ", ".join(unreadable[:3])))
+    if path_skipped:
+        notes.append("%d file(s) not scanned (skip_paths): %s"
+                     % (len(path_skipped), ", ".join(path_skipped[:3])))
     if missing:
         notes.append("%d file(s) git listed could not be located under %s: %s"
                      % (len(missing), cwd or "?", ", ".join(missing[:3])))
@@ -1093,7 +1213,7 @@ def _gl_score(rule_id):
     return 9  # a named provider rule is a specific credential shape, like the builtin's tier-1
 
 
-def parse_gitleaks(out, skip=None):
+def parse_gitleaks(out, skip=None, ignores=None, suppressed=None, fps=None):
     """gitleaks JSON report → (score, findings). Reads RuleID/File/StartLine only: `Secret` and
     `Match` carry the credential itself and must never reach a finding.
 
@@ -1116,10 +1236,19 @@ def parse_gitleaks(out, skip=None):
         if skip and skip(str(f.get("File") or "")):
             continue
         rid = str(f.get("RuleID") or "secret")
+        rel = str(f.get("File") or "?")
+        line = f.get("StartLine", "?")
+        reason = _ignored(ignores, rel, rid, line)
+        if reason is not None:
+            if suppressed is not None:
+                suppressed.append(("%s:%s:%s" % (rel, rid, line), reason))
+            continue
         score = _gl_score(rid)
         worst = max(worst, score)
-        rel = str(f.get("File") or "?")
-        hits.append((score, "%s — %s:%s" % (rid, rel, f.get("StartLine", "?"))))
+        label = "%s — %s:%s" % (rid, rel, line)
+        hits.append((score, label))
+        if fps is not None:
+            fps.setdefault(label, "%s:%s:%s" % (rel, rid, line))
     if not hits:
         return (1, [(1, "no findings")])
     hits.sort(key=lambda h: -h[0])
@@ -1132,7 +1261,9 @@ def run_gitleaks(spec, t, config=None):
     if not gl:
         return ("skip", "not installed", _install_hint(spec))
     if t.get("mode") == "write":
-        name = os.path.basename(t.get("file_path") or "") or "file.txt"
+        # the RELATIVE path, not the basename: an ignore entry has to mean the same thing
+        # whichever analyzer produced the finding and whichever layer ran it
+        name = _rel_for(t.get("file_path"), t.get("cwd")) or "file.txt"
         items, notes = [(name, t.get("content") or "")], []
     else:
         items, notes = _secret_file_set(t, config)
@@ -1155,10 +1286,12 @@ def run_gitleaks(spec, t, config=None):
                               capture_output=True, text=True, timeout=60)
         if proc.returncode not in (0, 1):  # 1 == leaks found
             return ("skip", "exited %d" % proc.returncode, "")
-        parsed = parse_gitleaks(proc.stdout.replace(tmpdir + os.sep, ""))
+        supp = []
+        parsed = parse_gitleaks(proc.stdout.replace(tmpdir + os.sep, ""),
+                                ignores=load_ignores(t.get("cwd")), suppressed=supp)
         if parsed is None:
             return ("skip", "unparseable output", _install_hint(spec))
-        return ("ok", parsed[0], parsed[1])
+        return ("ok", parsed[0], parsed[1], _suppression_notes(supp))
     except subprocess.TimeoutExpired:
         return ("skip", "timed out", "")
     except Exception as e:
@@ -1247,8 +1380,14 @@ def analyze(action, config=None, registry=None):
             else:
                 status = run_external(name, spec, t)
             if status[0] == "ok":
+                # `max_score` caps what an analyzer may contribute. A taint classifier that
+                # calls every heredoc a 10 is still worth reading; it is not worth letting it
+                # set the overall verdict. Capping keeps the finding and drops its authority.
+                cap = an_cfg.get(name, {}).get("max_score")
                 for s, lbl in status[2]:
-                    findings.append((name, s, lbl))
+                    findings.append((name, min(s, int(cap)) if cap else s, lbl))
+                if len(status) > 3 and on_missing != "silent":
+                    skipped += [(name, surf, reason, "") for reason in status[3]]
                 ran_any = True
                 satisfied.add(surf)
             elif on_missing != "silent":
